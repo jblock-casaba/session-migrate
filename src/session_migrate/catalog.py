@@ -25,6 +25,7 @@ from session_migrate.conversion import ConversionOptions, convert_session, load_
 from session_migrate.errors import JsonlError, SessionMigrateError
 from session_migrate.formats import (
     antigravity,
+    codex,
     devin,
     hermes,
     kimi,
@@ -2077,6 +2078,8 @@ def _scan_file(path: Path, agent_format: AgentFormat, root: Path) -> _Scan:
     cli_version = None
     history_mode = None
     history_base = False
+    codex_ordinals_broken = False
+    codex_previous_ordinal: int | None = None
     sidechain = False
     records = 0
     has_conversation = False
@@ -2119,6 +2122,16 @@ def _scan_file(path: Path, agent_format: AgentFormat, root: Path) -> _Scan:
                 payload = value.get("payload")
                 if not isinstance(payload, dict):
                     payload = {}
+                ordinal = value.get("ordinal")
+                if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+                    codex_ordinals_broken = True
+                elif codex_previous_ordinal is None:
+                    codex_ordinals_broken = codex_ordinals_broken or ordinal != 0
+                    codex_previous_ordinal = ordinal
+                else:
+                    if ordinal < codex_previous_ordinal:
+                        codex_ordinals_broken = True
+                    codex_previous_ordinal = ordinal
                 if record_type == "session_meta":
                     has_session_meta = True
                     session_id = session_id or _normalized_uuid(
@@ -2264,10 +2277,12 @@ def _scan_file(path: Path, agent_format: AgentFormat, root: Path) -> _Scan:
     elif agent_format == AgentFormat.CODEX:
         if not has_session_meta:
             status, reason = "corrupt", "missing_session_meta"
-        elif history_mode and history_mode != "legacy":
+        elif history_mode and history_mode not in codex.SUPPORTED_HISTORY_MODES:
             status, reason = "unsupported", "codex_history_mode"
         elif history_base:
             status, reason = "unsupported", "codex_history_base"
+        elif history_mode == "paginated" and codex_ordinals_broken:
+            status, reason = "unsupported", "codex_paginated_ordinals"
         elif not has_conversation:
             status, reason = "corrupt", "no_conversation_records"
     elif agent_format == AgentFormat.PI:

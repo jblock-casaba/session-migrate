@@ -1,14 +1,17 @@
-"""GitHub Copilot CLI 1.0.70 session-event reader and writer.
+"""GitHub Copilot CLI version-1 session reader and pinned 1.0.70 writer.
 
 Copilot's canonical portable history is the append-only ``events.jsonl`` file
 below ``$COPILOT_HOME/session-state/<uuid>``.  The global and per-session SQLite
 files are projections/runtime state and are deliberately not synthesized.
 
 The source reader is based on the generated ``session-events.d.ts`` shipped in
-the exact 1.0.70 platform package.  It accepts that complete event-name union,
-but projects only model-visible conversation semantics.  Unknown schemas fail
-closed; lifecycle, privileged, sub-agent, and UI-only records become explicit
-opaque loss events rather than being flattened into the main conversation.
+the exact 1.0.70 platform package. It also recognizes explicitly listed newer
+diagnostic records without replaying their model-input snapshots. Copilot adds
+event names in nearly every release, so an unrecognized name becomes a counted
+opaque loss that names the type, after the same envelope checks; malformed
+envelopes and recognized payloads still fail closed. Lifecycle, privileged,
+sub-agent, and UI-only records become explicit opaque loss events rather than
+being flattened into the main conversation.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import uuid
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -24,7 +28,12 @@ from pathlib import Path
 from typing import Any
 
 from session_migrate.errors import SessionMigrateError
-from session_migrate.formats.common import portable_data_image, string, valid_rfc3339
+from session_migrate.formats.common import (
+    object_value,
+    portable_data_image,
+    string,
+    valid_rfc3339,
+)
 from session_migrate.jsonl import encode_jsonl, file_sha256, iter_jsonl
 from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Role, Session
 
@@ -41,6 +50,35 @@ _EMITTED_TYPES = {
     "session.compaction_complete",
     "session.binary_asset",
 }
+# Newer traces repeat model inputs and responses; only the canonical message/tool
+# events belong in the conversation. Never accept arbitrary model.* event names.
+_MODEL_TRACE_SOURCE_TYPES = {
+    "model.captured_assignment_context",
+    "model.message",
+    "model.messages_snapshot",
+    "model.model_call_failure",
+    "model.model_call_started",
+    "model.model_call_success",
+    "model.response",
+    "model.telemetry",
+    "model.turn_ended",
+    "model.turn_failed",
+    "model.turn_retry",
+    "model.turn_started",
+}
+_SOURCE_DIAGNOSTIC_TYPES = _MODEL_TRACE_SOURCE_TYPES | {
+    "session.usage_checkpoint",
+    "session.usage_record",
+    "subagent.configured",
+}
+# Every recognized post-1.0.70 event; the non-diagnostic ones are validated and
+# projected explicitly below.
+_NEWER_SOURCE_TYPES = _SOURCE_DIAGNOSTIC_TYPES | {
+    "session.context_cleared",
+    "session.mode_notice_delivered",
+}
+# Shape of an unrecognized event name that is skipped rather than rejected.
+_SOURCE_EVENT_NAME = re.compile(r"[a-z][A-Za-z0-9_]{0,63}(?:\.[a-z][A-Za-z0-9_]{0,63}){0,7}")
 _KNOWN_SOURCE_TYPES = {
     "abort",
     "assistant.intent",
@@ -133,7 +171,7 @@ _KNOWN_SOURCE_TYPES = {
     "user.message",
     "user_input.completed",
     "user_input.requested",
-}
+} | _NEWER_SOURCE_TYPES
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +537,7 @@ def parse(path: Path) -> ParsedCopilotSession:
     events: list[Event] = []
     referenced_assets: set[str] = set()
     emitted_calls: Counter[str] = Counter()
+    task_completions: set[str] = set()
     tool_names: dict[str, str] = {}
     model = string(first_data.get("selectedModel"))
     title: str | None = None
@@ -513,10 +552,19 @@ def parse(path: Path) -> ParsedCopilotSession:
             )
         )
 
+    latest: tuple[datetime, str] | None = None
     for index, record in enumerate(records):
         record_type = record["type"]
         data = record["data"]
         timestamp = record["timestamp"]
+        moment = _parse_timestamp(valid_rfc3339(timestamp) or timestamp)
+        if latest is not None and moment < latest[0]:
+            # Concurrent writers (sub-agent lifecycle, for one) can log milliseconds out
+            # of order. File order is authoritative, so hold the clock instead.
+            timestamp = latest[1]
+            opaque(index, record_type, "copilot_timestamp_out_of_order", timestamp)
+        else:
+            latest = (moment, timestamp)
         provenance = Provenance(index, record_type, record["id"])
         if string(record.get("agentId")):
             opaque(index, record_type, "copilot_subagent_scoped_event", timestamp)
@@ -597,6 +645,21 @@ def parse(path: Path) -> ParsedCopilotSession:
                 tool_name = request["name"]
                 emitted_calls[call_id] += 1
                 tool_names[call_id] = tool_name
+                summary = string(object_value(request.get("arguments")).get("summary"))
+                if tool_name == "task_complete" and summary:
+                    # Autopilot's final report exists only as this control-tool argument,
+                    # which Copilot displays as the answer; replay it as assistant text.
+                    task_completions.add(call_id)
+                    events.append(
+                        Event(
+                            kind=EventKind.MESSAGE,
+                            role=Role.ASSISTANT,
+                            text=summary,
+                            timestamp=timestamp,
+                            provenance=Provenance(index, record_type, record["id"], block_index),
+                        )
+                    )
+                    continue
                 payload: dict[str, Any] = {"input": request.get("arguments", {})}
                 namespace = string(request.get("mcpServerName"))
                 if namespace:
@@ -640,6 +703,9 @@ def parse(path: Path) -> ParsedCopilotSession:
                 )
         elif record_type == "tool.execution_complete":
             call_id = data["toolCallId"]
+            if call_id in task_completions:
+                opaque(index, record_type, "copilot_task_complete_tool", timestamp)
+                continue
             if data.get("isUserRequested") is True:
                 opaque(index, record_type, "copilot_user_requested_tool_result", timestamp)
                 continue
@@ -681,6 +747,20 @@ def parse(path: Path) -> ParsedCopilotSession:
                 )
             else:
                 opaque(index, record_type, "copilot_compaction_without_summary", timestamp)
+        elif record_type == "session.context_cleared":
+            # The next context window starts from initialMessage alone, so a clear is a
+            # compaction boundary carrying that message (or nothing) forward.
+            events.append(
+                Event(
+                    kind=EventKind.COMPACTION,
+                    role=Role.SYSTEM,
+                    text=string(data.get("initialMessage")),
+                    timestamp=timestamp,
+                    provenance=provenance,
+                )
+            )
+        elif record_type == "session.mode_notice_delivered" and string(data.get("content")):
+            opaque(index, record_type, "copilot_privileged_mode_notice", timestamp)
         elif record_type == "session.model_change":
             model = string(data.get("newModel")) or model
             opaque(index, record_type, "copilot_model_change_metadata", timestamp)
@@ -688,8 +768,12 @@ def parse(path: Path) -> ParsedCopilotSession:
             title = string(data.get("title")) or title
         elif record_type == "system.message":
             opaque(index, record_type, "copilot_privileged_system_message", timestamp)
+        elif record_type in _SOURCE_DIAGNOSTIC_TYPES:
+            opaque(index, record_type, "copilot_diagnostic_event", timestamp)
         elif record_type == "session.binary_asset":
             continue
+        elif record_type not in _KNOWN_SOURCE_TYPES:
+            opaque(index, record_type, f"copilot_unrecognized_event:{record_type}", timestamp)
         elif record_type != "session.start":
             opaque(index, record_type, "copilot_native_lifecycle_or_ui_event", timestamp)
 
@@ -800,7 +884,7 @@ def _decode_native_records(data: bytes) -> list[dict[str, Any]]:
 
 
 def _validate_source_records(records: list[dict[str, Any]], *, path: Path) -> None:
-    """Validate persisted 1.0.70 source envelopes and projected payloads."""
+    """Validate supported version-1 source envelopes and projected payloads."""
 
     if not records or records[0].get("type") != "session.start":
         raise SessionMigrateError("Copilot session must begin with session.start")
@@ -827,15 +911,15 @@ def _validate_source_records(records: list[dict[str, Any]], *, path: Path) -> No
         if not cwd or "\0" in cwd:
             raise SessionMigrateError("Copilot working directory context is invalid")
 
-    prior_id: str | None = None
     seen_ids: set[str] = set()
-    last_time: datetime | None = None
     start_count = 0
     for index, record in enumerate(records):
         _ensure_json_bounds(record)
         record_type = string(record.get("type"))
-        if record_type not in _KNOWN_SOURCE_TYPES:
-            raise SessionMigrateError(f"unsupported Copilot source event: {record_type}")
+        if record_type not in _KNOWN_SOURCE_TYPES and not (
+            record_type and _SOURCE_EVENT_NAME.fullmatch(record_type)
+        ):
+            raise SessionMigrateError("Copilot event type is invalid")
         if record_type == "session.start":
             start_count += 1
             if index != 0:
@@ -849,23 +933,70 @@ def _validate_source_records(records: list[dict[str, Any]], *, path: Path) -> No
         if not event_id or not _is_uuid4(event_id) or event_id in seen_ids:
             raise SessionMigrateError("Copilot event IDs must be unique UUIDv4 values")
         seen_ids.add(event_id)
-        if record.get("parentId") != prior_id:
-            raise SessionMigrateError("Copilot event parent chain is not linear")
-        prior_id = event_id
-        timestamp = valid_rfc3339(record.get("timestamp"))
-        if not timestamp:
+        parent_id = record.get("parentId")
+        if parent_id is not None and (not isinstance(parent_id, str) or not _is_uuid4(parent_id)):
+            raise SessionMigrateError("Copilot event parent chain contains an invalid ID")
+        if not valid_rfc3339(record.get("timestamp")):
             raise SessionMigrateError("Copilot event timestamp is invalid")
-        parsed_time = _parse_timestamp(timestamp)
-        if last_time is not None and parsed_time < last_time:
-            raise SessionMigrateError("Copilot event timestamps are not ordered")
-        last_time = parsed_time
         data = record.get("data")
         if not isinstance(data, dict):
             raise SessionMigrateError("Copilot event data must be an object")
         _validate_source_payload(record_type, data)
     if start_count != 1:
         raise SessionMigrateError("Copilot session must contain one session.start event")
+    _validate_source_parent_chains(records)
     _validate_source_references(records)
+
+
+def _outside_mainline(record_type: str) -> bool:
+    """Whether an event may sit off the main chain, which may pass through it.
+
+    Unrecognized events are treated like model traces: their linkage is unknown and
+    they never supply conversation content.
+    """
+
+    return record_type in _MODEL_TRACE_SOURCE_TYPES or record_type not in _KNOWN_SOURCE_TYPES
+
+
+def _validate_source_parent_chains(records: list[dict[str, Any]]) -> None:
+    """Validate mainline ancestry without treating tracing chains as conversation."""
+
+    if records[0].get("parentId") is not None:
+        raise SessionMigrateError("Copilot event parent chain has no root")
+    by_id = {record["id"]: record for record in records}
+    ancestors: dict[str, str | None] = {}
+
+    def main_ancestor(parent_id: str | None) -> str | None:
+        visited: set[str] = set()
+        while parent_id is not None and parent_id not in ancestors:
+            if parent_id in visited:
+                raise SessionMigrateError("Copilot event parent chain contains a cycle")
+            parent = by_id.get(parent_id)
+            if parent is None:
+                parent_id = None
+                break
+            if not parent.get("agentId") and not _outside_mainline(parent["type"]):
+                break
+            visited.add(parent_id)
+            parent_id = parent.get("parentId")
+        ancestor = ancestors.get(parent_id, parent_id) if parent_id is not None else None
+        for event_id in visited:
+            ancestors[event_id] = ancestor
+        return ancestor
+
+    previous_main_id = records[0]["id"]
+    for record in records[1:]:
+        # Tracing can have independent roots and refer to unpersisted trace events.
+        # It must never supply conversation content or bypass mainline validation.
+        if _outside_mainline(record["type"]):
+            continue
+        ancestor = main_ancestor(record.get("parentId"))
+        if ancestor is None:
+            raise SessionMigrateError("Copilot event parent chain is missing an ancestor")
+        if not record.get("agentId"):
+            if ancestor != previous_main_id:
+                raise SessionMigrateError("Copilot main event parent chain is not linear")
+            previous_main_id = record["id"]
 
 
 def _validate_source_payload(record_type: str, data: dict[str, Any]) -> None:
@@ -905,14 +1036,10 @@ def _validate_source_payload(record_type: str, data: dict[str, Any]) -> None:
                 or not string(request.get("name"))
             ):
                 raise SessionMigrateError("Copilot tool request is missing linkage")
-            arguments = request.get("arguments", {})
-            if not isinstance(arguments, dict):
-                raise SessionMigrateError("Copilot tool request arguments must be an object")
+        # Arguments are any JSON value: custom tools such as apply_patch take raw text.
     elif record_type == "tool.execution_start":
         if not string(data.get("toolCallId")) or not string(data.get("toolName")):
             raise SessionMigrateError("Copilot tool start is missing linkage")
-        if not isinstance(data.get("arguments", {}), dict):
-            raise SessionMigrateError("Copilot tool start arguments must be an object")
     elif record_type == "tool.execution_complete":
         if not string(data.get("toolCallId")) or not isinstance(data.get("success"), bool):
             raise SessionMigrateError("Copilot tool result is missing linkage")
@@ -941,6 +1068,19 @@ def _validate_source_payload(record_type: str, data: dict[str, Any]) -> None:
             data.get("summaryContent"), str
         ):
             raise SessionMigrateError("Copilot compaction summary is invalid")
+    elif record_type == "session.context_cleared":
+        cleared = data.get("messagesCleared")
+        if not isinstance(cleared, int) or isinstance(cleared, bool) or cleared < 0:
+            raise SessionMigrateError("Copilot context clear count is invalid")
+        if data.get("initialMessage") is not None and not isinstance(
+            data.get("initialMessage"), str
+        ):
+            raise SessionMigrateError("Copilot context clear initial message is invalid")
+    elif record_type == "session.mode_notice_delivered":
+        if not string(data.get("mode")):
+            raise SessionMigrateError("Copilot mode notice is invalid")
+        if data.get("content") is not None and not isinstance(data.get("content"), str):
+            raise SessionMigrateError("Copilot mode notice content is invalid")
     elif record_type == "session.model_change":
         if not string(data.get("newModel")):
             raise SessionMigrateError("Copilot model change is invalid")
@@ -1415,8 +1555,12 @@ def _format_timestamp(value: datetime) -> str:
 def _omission_key(event: Event) -> str:
     if event.kind == EventKind.MESSAGE and event.role not in {Role.USER, Role.ASSISTANT}:
         return "message:privileged_role"
-    if event.kind == EventKind.CONTEXT and event.role not in {Role.USER, None}:
-        return "context:privileged_image"
+    if event.kind == EventKind.CONTEXT:
+        block_type = string(event.payload.get("block_type"))
+        if block_type in {"codex_injected_user_context", "claude_injected_user_context"}:
+            return f"context:{block_type}"
+        if event.role not in {Role.USER, None}:
+            return "context:privileged_image"
     if event.kind == EventKind.OPAQUE:
         reason = string(event.payload.get("reason"))
         return f"opaque:{reason}" if reason else "opaque"

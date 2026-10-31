@@ -6,9 +6,9 @@ for the same executable.
 ## Commands
 
 ```text
-session-migrate inspect PATH [--format FORMAT] [--json]
-session-migrate convert PATH --to TARGET --output PATH [OPTIONS]
-session-migrate import PATH --to TARGET [--home PATH] [--dry-run] [OPTIONS]
+session-migrate inspect SOURCE [--format FORMAT] [--json]
+session-migrate convert SOURCE --to TARGET --output PATH [OPTIONS]
+session-migrate import SOURCE --to TARGET [--home PATH] [--dry-run] [OPTIONS]
 session-migrate transfer SOURCE_ID --from FORMAT --to TARGET [OPTIONS]
 session-migrate transfer --catalog-id ID --to TARGET [OPTIONS]
 session-migrate transfer --title TITLE [--from FORMAT] --to TARGET [OPTIONS]
@@ -18,6 +18,16 @@ session-migrate catalog list [FILTERS]
 session-migrate catalog search QUERY [FILTERS]
 session-migrate catalog show CATALOG_ID [--include-paths] [--json]
 ```
+
+`SOURCE` is either a filesystem path (transcript, native session directory, or
+supported export bundle) or a native session ID as the agent itself prints it.
+An ID is resolved against the default home of each file-based agent, so
+`import 01a0573d-…` finds `~/.codex/sessions/…/rollout-…-01a0573d-….jsonl`
+without the caller translating it first. An existing path always wins. Pass
+`--format` to scope the search to one agent when an ID is ambiguous, and use
+`transfer` for OpenCode, Kilo, Hermes, MastraCode, and Devin, whose sessions are
+reached through their own CLIs or shared databases rather than a predictable
+file layout.
 
 `FORMAT` and `TARGET` accept:
 
@@ -37,6 +47,7 @@ tool arguments/results, image bytes, or titles.
 
 ```bash
 smigrate inspect ~/.codex/sessions/2026/08/20/rollout-...jsonl
+smigrate inspect 01a0573d-078a-7580-b7ed-dd0228839f35
 smigrate inspect ./store.db --format cursor --json
 ```
 
@@ -76,6 +87,7 @@ shared databases; MastraCode uses a valid one-thread LibSQL database artifact.
 ```bash
 smigrate import SOURCE --to pi --cwd "$PWD" --dry-run
 smigrate import SOURCE --to pi --cwd "$PWD"
+smigrate import 01a0573d-078a-7580-b7ed-dd0228839f35 --to copilot
 ```
 
 The target paths are collision checked and never overwritten. `--dry-run`
@@ -146,6 +158,7 @@ default. Every other source requires an explicit target.
 | `--cwd PATH` | Target working directory; precedence is option, source CWD, process CWD |
 | `--target-cli-version VERSION` | Change emitted metadata only; the writer architecture remains pinned |
 | `--target-cli PATH` | Pinned OpenCode, Kilo, Antigravity, Cursor, or Hermes executable/source for native import |
+| `--since-last-compaction` | Transfer only the window the source agent would itself resume with |
 | `--model-provider ID` | Codex, Pi, OMP, OpenCode, or Muse target provider |
 | `--model ID` | Target model label for formats that persist one, including Grok, Kilo, and OpenHands |
 | `--home PATH` | Target native home, except OpenCode and Kilo |
@@ -155,6 +168,29 @@ An irrelevant target-specific option may be accepted but has no effect. The
 manifest records the target metadata version and warns when it differs from the
 validated writer pin. Automatic OpenCode, Kilo, Antigravity, Cursor, and Hermes
 installation still requires the exact pinned version.
+
+### `--since-last-compaction`
+
+By default a migration replays the whole transcript, including history the source
+agent had already compacted away. That is the faithful record, but a long session
+can exceed the target model's context window several times over, which makes the
+imported session unusable for an actual resume.
+
+`--since-last-compaction` keeps what the source itself carried forward: the
+plaintext messages from its last replacement history, followed by every later
+event. Everything before that boundary is dropped, and the manifest reports a
+`truncated_to_last_compaction` warning with the event counts on each side.
+
+The compaction summary is carried over only when the source recorded it as
+plaintext. Claude writes its summary as a readable `isCompactSummary` message, so
+a truncated Claude migration keeps the summary that frames the remaining turns.
+In every observed Codex rollout the `compacted.message` field is empty and the
+replacement history ends in a provider-encrypted `compaction` item, so there the
+summary survives only as a counted opaque placeholder and the carried anchor
+messages, not the summary, give the resumed session its framing.
+
+The option fails closed when a session has no compaction boundary, because the
+full transcript is already its effective window.
 
 ## Home resolution
 

@@ -6,6 +6,100 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Accept repeated Claude record UUIDs when only optional `promptId` and `slug`
+  bookkeeping differs. Replay the first copy once and report later copies as
+  `opaque:duplicate_record_uuid`; preserve conflict and ancestry validation.
+- Accept explicitly recognized newer Copilot model diagnostics, usage
+  checkpoints, and sub-agent configuration as counted opaque events. Do not
+  replay their input/response snapshots as conversation messages. Keep all
+  size, identity, timestamp, and payload checks. Validate mainline ancestry separately from detached model tracing
+  chains and interleaved sub-agent metadata.
+- Accept newer Copilot `session.mode_notice_delivered`, `session.context_cleared`,
+  `session.usage_record`, `model.telemetry`, and `model.turn_retry` events instead
+  of failing with `unsupported Copilot source event`. A context clear is now a
+  compaction boundary for `--since-last-compaction`, carrying its
+  `initialMessage` as the summary; a mode notice's model-visible text is counted
+  as `opaque:copilot_privileged_mode_notice` and not replayed.
+- Stop failing Copilot migrations with `unsupported Copilot source event` when a
+  newer Copilot release adds an event name. A well-formed unrecognized event now
+  passes the same envelope checks, is skipped without copying its payload, and
+  is reported as `opaque:copilot_unrecognized_event:<name>` with a warning;
+  malformed names and recognized payloads still fail closed.
+- Accept Copilot tool arguments of any JSON type, as Copilot's schema allows,
+  instead of failing with `tool request arguments must be an object`. Custom
+  tools such as `apply_patch` pass raw patch text; it is kept as the tool input
+  and wrapped as `{"input": ...}` for targets that require an object.
+- Accept Copilot events logged a few milliseconds before their predecessor by a
+  concurrent writer, instead of failing with `event timestamps are not ordered`.
+  File order is kept; the event takes the preceding timestamp and is counted as
+  `opaque:copilot_timestamp_out_of_order`.
+- Replay a Copilot autopilot `task_complete` summary as the final assistant
+  reply instead of a tool call. The report exists only as that tool's argument,
+  so a migrated autopilot session previously appeared to end without its answer;
+  the replaced call/result pair is counted as `opaque:copilot_task_complete_tool`.
+- Filter the slash commands, local command output, and background task notices that
+  Claude records as user-role turns, so they are no longer imported as prompts the
+  human never typed. Command envelopes are Claude's own serialization of an
+  invocation and are filtered even when the record carries
+  `origin.kind == "human"`; `<task-notification>` defers to that marker. Counted as
+  `context:claude_injected_user_context`.
+- Carry a compaction summary through `--since-last-compaction` when the source
+  recorded it as plaintext. Claude writes its summary as a readable
+  `isCompactSummary` message, so a truncated Claude migration keeps the summary that
+  frames the remaining turns; Codex's is provider-encrypted and still cannot be
+  recovered.
+
+- Add `--since-last-compaction` to `convert`, `import`, and `transfer`. A full
+  transcript replays history the source agent had already compacted away, so a
+  long session can exceed the target model's context window several times over
+  and cannot actually be resumed. The option keeps what the source itself
+  carried forward — the plaintext messages from its last replacement history,
+  then every later event — and reports a `truncated_to_last_compaction` warning
+  with the event counts on each side. It fails closed when a session has no
+  compaction boundary. The summary itself stays unrecoverable: in every observed
+  rollout `compacted.message` is empty and the replacement history ends in a
+  provider-encrypted `compaction` item, so it survives only as a counted opaque
+  placeholder.
+- Retain the plaintext messages from Codex `compacted.replacement_history` on
+  the compaction event. The default expanded-transcript mapping still ignores
+  them, so existing output is unchanged.
+
+- Accept a native session ID wherever `inspect`, `convert`, and `import` accept
+  a path. An ID is resolved against the default home of each file-based agent,
+  so `import 01a0573d-…` finds the matching Codex rollout without the caller
+  translating it into a `rollout-<timestamp>-<uuid>.jsonl` path first. An
+  existing path still wins, `--format` scopes the search to one agent, and
+  OpenCode/Kilo/Hermes/MastraCode/Devin continue to be reached via `transfer`.
+
+- Read Codex `history_mode: paginated` rollouts (Codex 0.147.0 and later)
+  instead of rejecting them. The UI transcript that legacy carries in
+  `event_msg.user_message` / `agent_message` / `context_compacted` is now read
+  from `event_msg.item_completed` envelopes whose `item.type` is `UserMessage`,
+  `AgentMessage`, or `ContextCompaction`, and reuses the existing deduplication
+  and compaction-pairing paths.
+- Filter the environment state Codex injects as user-role response items so it
+  is no longer importable as a prompt the human never typed. This applies to
+  legacy and paginated sources alike, using each format's own UI transcript
+  (`event_msg.user_message` or `item_completed` `UserMessage` items) as the
+  positive evidence: a confirmed UI prompt is always kept, a known injected
+  wrapper (`<environment_context>`, `<recommended_plugins>`,
+  `<codex_internal_context>`, `<user_shell_command>`, `<subagent_notification>`,
+  `<turn_aborted>`, `<user_action>`, `<hook_prompt>`, `<skill>`, and
+  `# AGENTS.md instructions for …`) is counted as
+  `context:codex_injected_user_context`, and unrecognized text is preserved
+  because sub-agent threads receive real instructions that never reach a UI
+  transcript. `<image …>` is deliberately not treated as a wrapper because it
+  prefixes genuine user text. Sessions whose only user-role content was injected
+  context now carry no prompt, so targets that require a user turn refuse them
+  instead of resuming from a fabricated one.
+- Validate the paginated `ordinal` chain and fail closed when it is missing,
+  non-integer, decreasing, or does not start at zero, which is what
+  distinguishes a complete thread from a continuation page. `history_base` fork
+  lineage remains rejected, and the catalog reports incomplete chains as
+  `codex_paginated_ordinals` rather than listing them as convertible.
+- Dedupe UI projections against image-prefixed prompts so an attachment no
+  longer produces a duplicate user message.
+
 ## 0.10.0 - 2026-08-31
 
 - Add Hermes Agent 0.20.6, MastraCode 0.37.1, and Devin CLI 3000.6.7 as

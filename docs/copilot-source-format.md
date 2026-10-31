@@ -22,8 +22,9 @@ an auto-generated `copilot-sdk/generated/session-events.d.ts` whose header names
 `session-events.schema.json` as its source. The TypeScript file defines the full
 event-name union, required envelopes, attachment variants, tool calls/results,
 binary assets, compaction, and reasoning fields. The implementation accepts the
-complete pinned event-name union but projects only the portable subset described
-below. An event name outside that union fails closed.
+complete pinned event-name union plus the explicitly listed newer diagnostic
+events below, but projects only the portable subset. Other event names fail
+closed.
 
 The public repository tag and the npm package's build-metadata commit are both
 recorded because they are not the same identifier. The distributed package and
@@ -64,15 +65,20 @@ file-oriented `convert` output from being inspected elsewhere.
 | `assistant.message.content` | assistant message | Empty tool-only messages do not create empty text events. |
 | `assistant.message.reasoningText` | thinking | Readable reasoning survives in the IR; target support determines replay. |
 | `reasoningOpaque` / `encryptedContent` | opaque loss | The shipped schema describes these values as session-bound and stripped on resume, so they are never treated as portable thinking. |
-| `assistant.message.toolRequests` | tool call | Preserves ID, name, object arguments, and MCP server namespace. |
+| `assistant.message.toolRequests` | tool call | Preserves ID, name, arguments, and MCP server namespace. Arguments may be any JSON value, as the schema allows: custom tools such as `apply_patch` pass raw text, which targets that need an object receive as `{"input": ...}` and count as `tool_call:non_object_input`. |
+| `task_complete` tool request | assistant message | Autopilot's final report exists only as this tool's `summary` argument, which Copilot displays as the answer, so it is replayed as assistant text. The call/result pair (whose result repeats the summary) is counted as `copilot_task_complete_tool`. |
 | `tool.execution_start` | tool call fallback | Used only when no matching request was already projected; repeated IDs retain multiplicity. |
 | `tool.execution_complete` | tool result | Preserves success/error, model-facing text, and portable binary images. |
 | `session.compaction_complete` | compaction | Successful summaries survive. Failed or summary-less compactions are opaque. |
+| `session.context_cleared` | compaction | The next context window starts from `initialMessage` alone, so a clear is the boundary `--since-last-compaction` cuts at; `initialMessage` is carried as its summary when present. |
 | `session.title_changed` / `workspace.yaml` | title metadata | The most recent title event wins, then the sidecar name. |
 | `session.model_change` | model metadata + opaque loss | The final model is retained; the temporal model-switch event is not replayed. |
 | Root lifecycle, UI, permission, hook, usage, and shutdown events | opaque loss | Their type and reason are counted, but their potentially sensitive payload is not copied. |
+| Recognized newer model diagnostics, usage checkpoints and records, and sub-agent configuration | opaque loss | Counted as `copilot_diagnostic_event`; model-input snapshots are not replayed as duplicate conversation turns. |
+| Unrecognized well-formed event name | opaque loss | Counted as `copilot_unrecognized_event:<name>` with a warning; the payload is not copied. |
 | Any event carrying `agentId` | opaque loss | Sub-agent timelines are not flattened into the main model conversation. |
 | `system.message` | opaque loss | Privileged runtime prompts are not converted into user-controlled destination history. |
+| `session.mode_notice_delivered` | opaque loss | A model-visible `content` notice is privileged runtime input and counted as `copilot_privileged_mode_notice`; a content-less notice is lifecycle metadata. |
 
 Tool-result `result.content` is the model-facing text used by the pinned runtime.
 `binaryResultsForLlm` is the model-facing media surface. Full detailed UI output,
@@ -87,9 +93,10 @@ record, 100,000 records) plus a per-record structural limit of 64 levels and
 
 - exactly one leading `session.start` with schema version `1`;
 - a UUID session ID and matching canonical directory name;
-- unique UUIDv4 event IDs and the complete linear `parentId` chain;
-- ordered RFC 3339 timestamps and object-valued event data;
-- the pinned event-name union and non-persistence of ephemeral events;
+- unique UUIDv4 event IDs and linear main-conversation `parentId` ancestry;
+- valid RFC 3339 timestamps and object-valued event data;
+- well-formed event names (unrecognized ones are skipped as counted losses) and
+  non-persistence of ephemeral events;
 - required message, tool-linkage, result, model-change, title, and system fields;
 - bounded attachment, tool-request, content, and binary-result arrays;
 - base64 validity, decoded lengths, SHA-256 asset IDs, duplicate assets, and
@@ -136,11 +143,57 @@ uv run pytest -q tests/test_copilot_format.py tests/test_copilot_source.py
 ## Compatibility policy
 
 The recorded CLI version is metadata, not the schema discriminator. A session
-from another Copilot release is accepted only when it still uses event schema
-version `1` and every persisted event fits the pinned 1.0.70 event union and
-validated payload subset. A new event name, schema version, or incompatible
-portable payload is rejected rather than guessed. Updating the pin requires a
-new distributed-schema diff, sanitized native fixture, and exact-binary test.
+from another Copilot release is accepted when it still uses event schema version
+`1` and every recognized event fits the validated payload subset.
+
+Copilot adds event names in nearly every release (the 1.0.104 schema defines
+more than 50 that this reader does not list), so an unrecognized but well-formed
+name is not an error. After the same identity, timestamp, size, ephemeral, and
+object-payload checks, it becomes an opaque loss counted as
+`copilot_unrecognized_event:<name>`, and conversion warns that it was skipped.
+Its payload is never copied, and like a model trace it may sit outside the main
+ancestry chain. A new event that does carry conversation content therefore
+surfaces as a named warning instead of blocking the migration; recognize it
+explicitly to project it. Malformed names still fail closed.
+
+Version-1 captures reporting `1.0.83-0` also contain these recognized diagnostic
+records: `model.captured_assignment_context`, `model.message`,
+`model.messages_snapshot`, `model.model_call_failure`,
+`model.model_call_started`, `model.model_call_success`, `model.response`,
+`model.turn_ended`, `model.turn_failed`, `model.turn_started`,
+`session.usage_checkpoint`, and `subagent.configured`. Later version-1 captures
+(observed through `1.0.94-3`) add `model.telemetry`, `model.turn_retry`, and
+`session.usage_record`, recognized the same way, plus the schema-defined
+`session.context_cleared` and `session.mode_notice_delivered`, which are
+validated and projected as listed above. Their envelopes still
+undergo identity, timestamp, size, and object-payload checks.
+Their bodies are not projected, since request/response snapshots would
+duplicate canonical messages and may include privileged runtime input.
+Other `model.*` names follow the unrecognized-event policy above.
+
+Model traces may have independent roots and links to trace events not persisted
+in the conversation log. Sub-agent events may be appended out of parent order.
+Main-conversation ancestry is checked through skipped trace/sub-agent nodes,
+and sub-agent chains must attach to an existing mainline ancestor without
+cycles. Missing mainline ancestors, mainline forks, invalid parent IDs, and
+out-of-order mainline ancestry still fail closed.
+
+Concurrent Copilot writers can log an event a few milliseconds earlier than the
+one before it (observed after `subagent.started` and `subagent.completed`). File
+order is authoritative and no records are reordered: such an event takes the
+preceding timestamp, so every target still sees non-decreasing times, and is
+counted as `copilot_timestamp_out_of_order`.
+
+For `--since-last-compaction`, the last successful compaction with readable
+`summaryContent` is retained along with subsequent history. A later failed
+compaction does not replace that boundary. Codex receives the summary as a
+plaintext `compacted.message` record.
+
+Unrecognized event names, schema versions, or incompatible portable payloads
+are rejected rather than guessed. The writer and native-validation pin remain
+1.0.70; newer source-version warnings are still emitted. Updating that pin
+requires a new distributed-schema diff, sanitized native fixture, and
+exact-binary test.
 
 ## Primary references
 

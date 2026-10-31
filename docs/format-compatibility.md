@@ -220,6 +220,11 @@ Important graph and content behavior:
 - Without a valid recorded leaf, the last eligible conversation record is used.
   If it lacks a usable UUID, all eligible conversation records are retained in
   file order.
+- Repeated UUIDs are replayed once when their records match apart from optional
+  string-valued `promptId` and `slug` bookkeeping. The first occurrence retains
+  its provenance; later copies are counted as `opaque:duplicate_record_uuid`.
+  Distinct UUIDs are never merged just because their text matches. Conflicting
+  content, parent links, roles, flags, or other metadata still fail closed.
 - Inactive branch messages become opaque events and are reported as dropped on
   write. `isSidechain: true` records are never selected as the main branch.
 - Selected `isMeta: true` nodes remain in ancestry traversal but are emitted
@@ -296,20 +301,49 @@ post-compaction context transfer. The paired `event_msg.context_compacted` UI
 notification is deduplicated against the checkpoint.
 
 Other observed envelopes include `compacted`, `turn_context`, `world_state`,
-reasoning response items, inter-agent communication, and newer paginated or
-fork-related state. Those records are not all portable conversation history.
+reasoning response items, inter-agent communication, and fork-related state.
+Those records are not all portable conversation history.
+
+### Paginated rollouts
+
+Codex 0.147.0 and later write `history_mode: paginated`. `response_item` remains
+the canonical history, but the UI transcript moves from `event_msg.user_message`
+/ `agent_message` / `context_compacted` into `event_msg.item_completed`
+envelopes whose `item.type` is `UserMessage`, `AgentMessage`, or
+`ContextCompaction`. The reader maps those three onto the same deduplication and
+compaction-pairing paths used for legacy, and counts every other completed item
+kind (`Reasoning`, `CommandExecution`, `FileChange`, and so on) as an opaque UI
+projection of a record it already read.
+
+Every record in a paginated rollout is numbered. The reader requires that chain
+to start at zero and never decrease, which is what proves the file is the whole
+thread rather than a continuation page.
+
+`UserMessage` items are also the evidence used to separate real prompts from the
+environment state Codex injects as user-role response items. That separation is
+not paginated-specific: legacy rollouts carry the same evidence in
+`event_msg.user_message`, and both are filtered the same way. A response item
+whose text matches a confirmed UI prompt is always kept; one that matches a
+known injected wrapper is counted as `context:codex_injected_user_context`; and
+anything else is kept, because sub-agent threads receive real instructions that
+never appear in a UI transcript. Image attachments are excluded from the wrapper
+list, since `<image …>` prefixes genuine user text rather than replacing it.
+
+A session whose only user-role content was injected context therefore has no
+prompt to migrate, and targets that require a user turn refuse it rather than
+resuming from a fabricated one.
 
 ## Route support
 
 Every ordered pair among the eighteen formats is implemented, for 324 routes:
 
-- full portable adapters: Claude, Codex legacy, Pi, OMP, OpenCode, Copilot,
-  Antigravity, Vibe, Muse, Qwen, Kimi, Grok, Kilo, OpenHands, Hermes,
-  MastraCode, and Devin;
+- full portable adapters: Claude, Codex (legacy and paginated), Pi, OMP,
+  OpenCode, Copilot, Antigravity, Vibe, Muse, Qwen, Kimi, Grok, Kilo,
+  OpenHands, Hermes, MastraCode, and Devin;
 - experimental text-only adapter: Cursor.
 
 Same-format routes are portable rewrites into new sessions, not byte copies.
-Codex paginated/history-base sources remain fail-closed. Cursor is experimental,
+Codex `history_base` fork lineage remains fail-closed. Cursor is experimental,
 build-pinned, and deliberately transfers only ordered user/assistant text. The
 detailed table below explains the original Claude/Codex pair; target-specific
 behavior is documented in [Additional native formats](additional-target-formats.md)
@@ -350,7 +384,10 @@ Legend:
 | Inactive Claude branches | **Unsupported** | N/A | They become opaque events and are counted as dropped; no forks are created. |
 | Claude sidechains/subagents | **Unsupported** | N/A | The catalog indexes nested sidechains as unsupported, but direct lookup/conversion does not import them; transfer the parent session. |
 | Codex legacy linear history | N/A | **Supported** | Ordered response items become one linear Claude UUID graph. |
-| Codex paginated history/forks | N/A | **Unsupported** | Non-legacy `history_mode` and `history_base` are rejected rather than risking an incomplete import. Replacement-history compaction uses the expanded-transcript policy above. |
+| Codex paginated history | N/A | **Supported** | `history_mode: paginated` is read once its ordinal chain proves the file is a complete, ordered thread. UI `item_completed` envelopes supply the `UserMessage`/`AgentMessage`/`ContextCompaction` truth that legacy carries in `event_msg`. |
+| Codex injected user context | N/A | **Filtered** | User-role response items holding Codex-injected environment state (`<environment_context>`, `<recommended_plugins>`, `<codex_internal_context>`, `<user_shell_command>`, `<subagent_notification>`, `<turn_aborted>`, `<user_action>`, `<hook_prompt>`, `<skill>`, and `# AGENTS.md instructions for …`) are counted as `context:codex_injected_user_context` instead of being imported as prompts the human never typed. Applies to legacy and paginated alike. A prompt confirmed by the UI transcript always wins, and unrecognized text is kept. |
+| Claude injected user context | **Filtered** | N/A | Claude logs slash commands, their local output, and background notices as user-role turns. Command envelopes (`<command-name>`, `<command-message>`, `<command-args>`, `<local-command-stdout>`/`stderr`/`caveat`, `<bash-input>`/`stdout`/`stderr`) are Claude's own serialization of an invocation, so they are filtered even when the record is marked `origin.kind == "human"` for having run the command. `<task-notification>` is filtered unless that human marker is present. Everything else is kept, including records that predate the marker. Counted as `context:claude_injected_user_context`. |
+| Codex history-base forks | N/A | **Unsupported** | `history_base` lineage, and any paginated file whose ordinals are missing, decreasing, or do not start at zero, are rejected rather than risking a silently truncated import. Replacement-history compaction uses the expanded-transcript policy above. |
 | Codex UI-only messages | N/A | **Lossy fallback** | Used as the conversation when no response-item messages exist. In a mixed partial file, exact normalized duplicates are removed and unmatched projections are retained with `message:ui_only_projection`; fuzzy matching is never used. |
 | Turn context, policies, world state, snapshots | **Unsupported** | **Unsupported** | Codex `turn_context` is counted as context; `world_state` and `security_risk_score` become counted opaque events. Shell snapshots, approvals, external credential stores, MCP state, memories, goals, and configuration are outside transcript conversion. |
 | Unknown source records/blocks | **Unsupported** | **Unsupported** | They become content-free opaque/sentinel events where recognized and are counted at write time, including unknown nested tool-result blocks. |

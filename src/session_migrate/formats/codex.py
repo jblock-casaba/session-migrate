@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections import Counter, deque
+from collections.abc import Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,9 +19,40 @@ from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Rol
 
 PINNED_CODEX_VERSION = "0.144.4"
 
+SUPPORTED_HISTORY_MODES = frozenset({"legacy", "paginated"})
+
+_MESSAGE_TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text"})
+
+# Paginated rollouts carry the UI transcript as `item_completed` envelopes instead of
+# the legacy `user_message`/`agent_message`/`context_compacted` events.
+_ITEM_TEXT_BLOCK_TYPES = frozenset({"text", "Text", "input_text", "output_text"})
+
+# Codex injects environment state as user-role response items. They are model input but
+# never a prompt the human typed, so importing them verbatim fabricates user turns.
+# Every wrapper below was confirmed against Codex's own UI transcript to never carry a
+# real prompt; `<image ...>` is deliberately excluded because it prefixes genuine text.
+CONTEXTUAL_USER_WRAPPERS: tuple[str, ...] = (
+    "<environment_context>",
+    "<recommended_plugins>",
+    "<codex_internal_context",
+    "<user_shell_command>",
+    "<subagent_notification>",
+    "<turn_aborted>",
+    "<user_action>",
+    "<hook_prompt",
+    "<skill>",
+)
+AGENTS_INSTRUCTIONS_PREFIX = "# AGENTS.md instructions for "
+
+_IMAGE_ATTACHMENT_PREFIX = re.compile(r"\A(?:\s*<image\b[^>]*>\s*(?:</image>\s*)?)+", re.IGNORECASE)
+
 
 def parse(path: Path) -> Session:
     records = list(iter_jsonl(path))
+    history_mode = _canonical_history_mode(records)
+    if history_mode == "paginated":
+        _validate_paginated_ordinals(records)
+    genuine_user_texts = _ui_user_texts(records)
     events: list[Event] = []
     fallback_events: list[Event] = []
     context_compacted_events: list[Event] = []
@@ -32,7 +65,6 @@ def parse(path: Path) -> Session:
     response_message_count = 0
     response_messages: Counter[tuple[Role | None, str]] = Counter()
     title = None
-    canonical_meta_seen = False
 
     for record in records:
         value = record.value
@@ -41,15 +73,6 @@ def parse(path: Path) -> Session:
         payload = object_value(value.get("payload"))
         provenance = Provenance(record.index, record_type)
         if record_type == "session_meta":
-            if not canonical_meta_seen:
-                history_mode = string(payload.get("history_mode"))
-                if history_mode and history_mode != "legacy":
-                    raise SessionMigrateError(
-                        f"Codex history mode {history_mode!r} is not supported; expected legacy"
-                    )
-                if payload.get("history_base") is not None:
-                    raise SessionMigrateError("Codex history_base lineage is not supported")
-                canonical_meta_seen = True
             session_id = (
                 session_id or string(payload.get("id")) or string(payload.get("session_id"))
             )
@@ -60,7 +83,12 @@ def parse(path: Path) -> Session:
             model_provider = model_provider or string(payload.get("model_provider"))
             continue
         if record_type == "response_item":
-            parsed = _response_item_events(payload, timestamp, provenance)
+            parsed = _response_item_events(
+                payload,
+                timestamp,
+                provenance,
+                genuine_user_texts=genuine_user_texts,
+            )
             events.extend(parsed)
             response_message_count += sum(
                 event.kind == EventKind.MESSAGE and event.role in {Role.USER, Role.ASSISTANT}
@@ -108,6 +136,52 @@ def parse(path: Path) -> Session:
                         provenance=provenance,
                     )
                 )
+            elif event_type == "item_completed":
+                item = object_value(payload.get("item"))
+                item_type = string(item.get("type"))
+                item_text = _item_content_text(item.get("content"))
+                if item_type == "UserMessage":
+                    fallback_events.append(
+                        Event(
+                            kind=EventKind.MESSAGE,
+                            role=Role.USER,
+                            text=item_text,
+                            timestamp=timestamp,
+                            provenance=provenance,
+                        )
+                    )
+                elif item_type == "AgentMessage":
+                    fallback_events.append(
+                        Event(
+                            kind=EventKind.MESSAGE,
+                            role=Role.ASSISTANT,
+                            text=item_text,
+                            timestamp=timestamp,
+                            provenance=provenance,
+                        )
+                    )
+                elif item_type == "ContextCompaction":
+                    context_compacted_events.append(
+                        Event(
+                            kind=EventKind.OPAQUE,
+                            timestamp=timestamp,
+                            payload={"source_event_type": "context_compacted"},
+                            provenance=provenance,
+                        )
+                    )
+                else:
+                    events.append(
+                        Event(
+                            kind=EventKind.OPAQUE,
+                            timestamp=timestamp,
+                            payload={
+                                "source_event_type": (
+                                    f"item_completed:{item_type}" if item_type else "item_completed"
+                                )
+                            },
+                            provenance=provenance,
+                        )
+                    )
             elif event_type not in {"user_message", "agent_message"}:
                 events.append(
                     Event(
@@ -121,6 +195,12 @@ def parse(path: Path) -> Session:
             replacement_history = payload.get("replacement_history")
             if replacement_history is not None and not isinstance(replacement_history, list):
                 raise SessionMigrateError("Codex replacement_history must be an array")
+            carried = _replacement_history_events(
+                replacement_history,
+                timestamp,
+                provenance,
+                genuine_user_texts,
+            )
             events.append(
                 Event(
                     kind=EventKind.COMPACTION,
@@ -132,7 +212,11 @@ def parse(path: Path) -> Session:
                             {"replacement_history_expanded": True}
                             if replacement_history is not None
                             else {}
-                        )
+                        ),
+                        # The effective history Codex itself resumes with. Retained so a
+                        # caller can rebuild the post-compaction window; the default
+                        # expanded-transcript mapping ignores it.
+                        **({"carried_events": carried} if carried else {}),
                     },
                     provenance=provenance,
                 )
@@ -396,6 +480,8 @@ def _response_item_events(
     payload: dict[str, Any],
     timestamp: str | None,
     provenance: Provenance,
+    *,
+    genuine_user_texts: frozenset[str],
 ) -> list[Event]:
     item_type = string(payload.get("type"))
     if item_type == "message":
@@ -419,6 +505,24 @@ def _response_item_events(
         content = payload.get("content")
         if not isinstance(content, list):
             return result
+        if role == Role.USER:
+            marker = _contextual_user_marker(
+                _message_content_text(content),
+                genuine_user_texts,
+            )
+            if marker:
+                return [
+                    Event(
+                        kind=EventKind.CONTEXT,
+                        role=Role.USER,
+                        timestamp=timestamp,
+                        payload={
+                            "block_type": "codex_injected_user_context",
+                            "context_source": marker,
+                        },
+                        provenance=provenance,
+                    )
+                ]
         for block_index, block in enumerate(content):
             block_provenance = Provenance(
                 provenance.record_index,
@@ -583,9 +687,164 @@ def _envelope(timestamp: str, record_type: str, payload: dict[str, Any]) -> dict
     return {"timestamp": timestamp, "type": record_type, "payload": payload}
 
 
+def _replacement_history_events(
+    replacement_history: Any,
+    timestamp: str | None,
+    provenance: Provenance,
+    genuine_user_texts: frozenset[str],
+) -> tuple[Event, ...]:
+    """Parse the plaintext history Codex carries across a compaction boundary.
+
+    The trailing `compaction` item holds the summary, but it is provider-encrypted in
+    every observed rollout, so only the surrounding messages are portable.
+    """
+
+    if not isinstance(replacement_history, list):
+        return ()
+    carried: list[Event] = []
+    for item in replacement_history:
+        if not isinstance(item, dict):
+            continue
+        carried.extend(
+            _response_item_events(
+                item,
+                timestamp,
+                provenance,
+                genuine_user_texts=genuine_user_texts,
+            )
+        )
+    return tuple(carried)
+
+
 def _message_fingerprint(event: Event) -> tuple[Role | None, str]:
-    normalized = (event.text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return event.role, normalized
+    return event.role, _normalized_user_text(event.text or "")
+
+
+def _canonical_history_mode(records: Sequence[Any]) -> str | None:
+    """Validate the first session_meta and return its history mode."""
+
+    for record in records:
+        value = record.value
+        if string(value.get("type")) != "session_meta":
+            continue
+        payload = object_value(value.get("payload"))
+        history_mode = string(payload.get("history_mode"))
+        if history_mode and history_mode not in SUPPORTED_HISTORY_MODES:
+            supported = ", ".join(sorted(SUPPORTED_HISTORY_MODES))
+            raise SessionMigrateError(
+                f"Codex history mode {history_mode!r} is not supported; expected {supported}"
+            )
+        if payload.get("history_base") is not None:
+            raise SessionMigrateError("Codex history_base lineage is not supported")
+        return history_mode
+    return None
+
+
+def _validate_paginated_ordinals(records: Sequence[Any]) -> None:
+    """Fail closed when a paginated rollout is not a complete, ordered transcript.
+
+    Paginated rollouts number every record. A missing, non-integer, decreasing, or
+    non-zero starting ordinal means this file is not the whole thread, so importing it
+    would silently drop history.
+    """
+
+    previous: int | None = None
+    for record in records:
+        ordinal = record.value.get("ordinal")
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+            raise SessionMigrateError(
+                f"Codex paginated rollout is missing an integer 'ordinal' at record {record.index}"
+            )
+        if previous is None:
+            if ordinal != 0:
+                raise SessionMigrateError(
+                    f"Codex paginated rollout starts at ordinal {ordinal}; expected 0 "
+                    "because earlier pages are not present in this file"
+                )
+        elif ordinal < previous:
+            raise SessionMigrateError(
+                f"Codex paginated ordinals decrease at record {record.index} "
+                f"({ordinal} after {previous})"
+            )
+        previous = ordinal
+
+
+def _message_content_text(content: Sequence[Any]) -> str:
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and string(block.get("type")) in _MESSAGE_TEXT_BLOCK_TYPES:
+            text = string(block.get("text"))
+            if text:
+                parts.append(text)
+    return "".join(parts)
+
+
+def _item_content_text(content: Any) -> str:
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and string(block.get("type")) in _ITEM_TEXT_BLOCK_TYPES:
+            text = string(block.get("text"))
+            if text:
+                parts.append(text)
+    return "".join(parts)
+
+
+def _ui_user_texts(records: Sequence[Any]) -> frozenset[str]:
+    """Collect the prompts Codex actually showed as user turns in its own UI.
+
+    Legacy rollouts record these as ``event_msg.user_message``; paginated rollouts
+    record them as ``item_completed`` items. A file uses one form or the other.
+    """
+
+    texts: set[str] = set()
+    for record in records:
+        value = record.value
+        if string(value.get("type")) != "event_msg":
+            continue
+        payload = object_value(value.get("payload"))
+        payload_type = string(payload.get("type"))
+        if payload_type == "user_message":
+            text = string(payload.get("message")) or ""
+        elif payload_type == "item_completed":
+            item = object_value(payload.get("item"))
+            if string(item.get("type")) != "UserMessage":
+                continue
+            text = _item_content_text(item.get("content"))
+        else:
+            continue
+        normalized = _normalized_user_text(text)
+        if normalized:
+            texts.add(normalized)
+    return frozenset(texts)
+
+
+def _normalized_user_text(text: str) -> str:
+    """Normalize for comparison, dropping the image attachments Codex prepends."""
+
+    without_attachments = _IMAGE_ATTACHMENT_PREFIX.sub("", text)
+    return without_attachments.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _contextual_user_marker(text: str, genuine_user_texts: frozenset[str]) -> str | None:
+    """Name the injected wrapper when a user-role item is not a real prompt.
+
+    Confirmed UI prompts always win, so a genuine message is never reclassified. Text
+    that matches no known wrapper is kept as a user message, because sub-agent threads
+    receive real instructions that never appear in a UI transcript.
+    """
+
+    normalized = _normalized_user_text(text)
+    if not normalized or normalized in genuine_user_texts:
+        return None
+    lowered = normalized.lower()
+    for wrapper in CONTEXTUAL_USER_WRAPPERS:
+        if lowered.startswith(wrapper):
+            return wrapper.lstrip("<").rstrip(">")
+    if normalized.startswith(AGENTS_INSTRUCTIONS_PREFIX):
+        return "agents_md_instructions"
+    return None
 
 
 def _omission_key(event: Event) -> str:

@@ -26,6 +26,7 @@ SIDECHAIN_ID = "33333333-3333-4333-8333-333333333333"
 CODEX_ID = "44444444-4444-4444-8444-444444444444"
 ARCHIVED_ID = "55555555-5555-4555-8555-555555555555"
 PAGINATED_ID = "66666666-6666-4666-8666-666666666666"
+TRUNCATED_ID = "68686868-6868-4868-8868-686868686868"
 CORRUPT_ID = "77777777-7777-4777-8777-777777777777"
 PI_ID = "018f3d20-7a6b-7c8d-9e0f-123456789abc"
 PI_PARENT_ID = "018f3d20-6a5b-7c8d-9e0f-123456789abc"
@@ -71,6 +72,7 @@ def _codex_records(
     title: str | None = None,
     history_mode: str = "legacy",
     current_name_field: bool = False,
+    first_ordinal: int | None = None,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = [
         {
@@ -106,6 +108,10 @@ def _codex_records(
                 },
             }
         )
+    if history_mode == "paginated":
+        start = 0 if first_ordinal is None else first_ordinal
+        for offset, record in enumerate(records):
+            record["ordinal"] = start + offset
     return records
 
 
@@ -301,12 +307,17 @@ def test_codex_active_archive_paginated_and_native_titles(tmp_path: Path) -> Non
     active = home / "sessions" / "2026" / "08" / "18" / f"rollout-synthetic-{CODEX_ID}.jsonl"
     archived = home / "archived_sessions" / f"rollout-synthetic-{ARCHIVED_ID}.jsonl"
     paginated = home / "sessions" / "2026" / "08" / "18" / f"rollout-synthetic-{PAGINATED_ID}.jsonl"
+    truncated = home / "sessions" / "2026" / "08" / "18" / f"rollout-synthetic-{TRUNCATED_ID}.jsonl"
     _write_jsonl(
         active,
         _codex_records(CODEX_ID, title="Rollout event name", current_name_field=True),
     )
     _write_jsonl(archived, _codex_records(ARCHIVED_ID))
     _write_jsonl(paginated, _codex_records(PAGINATED_ID, history_mode="paginated"))
+    _write_jsonl(
+        truncated,
+        _codex_records(TRUNCATED_ID, history_mode="paginated", first_ordinal=392),
+    )
 
     database = home / "state_5.sqlite"
     connection = sqlite3.connect(database)
@@ -336,7 +347,7 @@ def test_codex_active_archive_paginated_and_native_titles(tmp_path: Path) -> Non
 
     with _catalog(tmp_path) as catalog:
         result = catalog.refresh(codex_roots=(home,), include_auto=False)
-        assert result.statuses == {"candidate": 2, "unsupported": 1}
+        assert result.statuses == {"candidate": 3, "unsupported": 1}
         event_name = catalog.list_sessions(query="rollout event")
         assert len(event_name) == 1
         assert event_name[0].title_kind == "thread_name"
@@ -351,7 +362,7 @@ def test_codex_active_archive_paginated_and_native_titles(tmp_path: Path) -> Non
         unsupported = catalog.list_sessions(statuses=("unsupported",))
         assert len(unsupported) == 1
         assert unsupported[0].history_mode == "paginated"
-        assert unsupported[0].reason == "codex_history_mode"
+        assert unsupported[0].reason == "codex_paginated_ordinals"
 
         # A transiently unavailable vendor cache must not erase title metadata
         # already derived from it when the authoritative JSONL changes.

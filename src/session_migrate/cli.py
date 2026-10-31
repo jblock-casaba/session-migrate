@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from session_migrate import __version__
@@ -41,6 +42,7 @@ from session_migrate.conversion import (
     opencode_manifest_path,
     shared_database_manifest_path,
     target_import_paths,
+    truncate_to_last_compaction,
     write_artifact,
 )
 from session_migrate.discovery import locate_session, normalized_source_id
@@ -80,7 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument(
         "path",
         type=_expanded_path,
-        help="source transcript, native session directory, or supported export bundle",
+        help=(
+            "source session ID, transcript, native session directory, or supported export bundle"
+        ),
     )
     inspect_parser.add_argument(
         "--format", choices=tuple(AgentFormat), help="override source detection"
@@ -93,7 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "path",
         type=_expanded_path,
-        help="source transcript, native session directory, or supported export bundle",
+        help=(
+            "source session ID, transcript, native session directory, or supported export bundle"
+        ),
     )
     convert_parser.add_argument(
         "--to",
@@ -115,7 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument(
         "path",
         type=_expanded_path,
-        help="source transcript, native session directory, or supported export bundle",
+        help=(
+            "source session ID, transcript, native session directory, or supported export bundle"
+        ),
     )
     import_parser.add_argument(
         "--to",
@@ -387,7 +395,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_catalog(args)
         if args.command == "inspect":
             source_format = AgentFormat(args.format) if args.format else None
-            result = inspect_session(args.path, source_format=source_format)
+            result = inspect_session(
+                _resolve_source(args.path, source_format),
+                source_format=source_format,
+            )
             if args.json:
                 print(result.to_json())
             else:
@@ -546,7 +557,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             else:
                 source_format = AgentFormat(args.format) if args.format else None
-                session = load_session(args.path, source_format)
+                session = load_session(
+                    _resolve_source(args.path, source_format),
+                    source_format,
+                )
                 target_format = TargetFormat(args.to)
             if target_format == TargetFormat.OPENCODE and getattr(args, "home", None):
                 raise SessionMigrateError(OPENCODE_HOME_UNSUPPORTED)
@@ -567,6 +581,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--target-cli only applies to OpenCode/Kilo/Antigravity/Cursor import "
                     "and transfer, or Hermes import and transfer"
                 )
+            truncation: dict[str, int] = {}
+            if args.since_last_compaction:
+                session, truncation = truncate_to_last_compaction(session)
+                if not truncation:
+                    raise SessionMigrateError(
+                        "--since-last-compaction found no compaction boundary in this "
+                        "session; the full transcript is already its effective window"
+                    )
             artifact = convert_session(
                 session,
                 ConversionOptions(
@@ -578,6 +600,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     model=args.model,
                 ),
             )
+            if truncation:
+                artifact = replace(
+                    artifact,
+                    warnings=(
+                        *artifact.warnings,
+                        {
+                            "code": "truncated_to_last_compaction",
+                            "message": (
+                                "transferred only the window the source agent would "
+                                "resume with; a summary is carried over only when the "
+                                "source recorded it as plaintext"
+                            ),
+                            **truncation,
+                        },
+                    ),
+                )
             if args.command == "convert":
                 output_path = args.output
                 manifest_path = output_path.with_name(f"{output_path.name}.session-migrate.json")
@@ -750,6 +788,15 @@ def _add_conversion_arguments(
         ),
     )
     parser.add_argument(
+        "--since-last-compaction",
+        action="store_true",
+        help=(
+            "transfer only the window the source agent would itself resume with: the "
+            "plaintext history carried across its last compaction, plus every later "
+            "event (a full transcript often exceeds the target model's context window)"
+        ),
+    )
+    parser.add_argument(
         "--model-provider",
         help="Codex/Pi/OMP/OpenCode/Muse provider ID (target-specific default)",
     )
@@ -766,6 +813,84 @@ def _expanded_path(value: str) -> Path:
     """Expand a user-supplied home marker consistently for every CLI path."""
 
     return Path(value).expanduser()
+
+
+# Formats whose sessions are locatable as files under a well-known home. OpenCode and
+# Kilo export through their own CLIs, and the shared-database agents need an inventory
+# probe, so both are reached through `transfer` rather than guessed at here.
+_ID_LOOKUP_FORMATS: tuple[AgentFormat, ...] = (
+    AgentFormat.CODEX,
+    AgentFormat.CLAUDE,
+    AgentFormat.PI,
+    AgentFormat.OMP,
+    AgentFormat.COPILOT,
+    AgentFormat.ANTIGRAVITY,
+    AgentFormat.CURSOR,
+    AgentFormat.VIBE,
+    AgentFormat.MUSE,
+    AgentFormat.QWEN,
+    AgentFormat.KIMI,
+    AgentFormat.GROK,
+    AgentFormat.OPENHANDS,
+)
+
+
+def _resolve_source(value: Path, source_format: AgentFormat | None) -> Path:
+    """Accept either a transcript path or a native session ID.
+
+    Session IDs are what the agents themselves print, so requiring the caller to first
+    translate one into a `rollout-<timestamp>-<uuid>.jsonl` path is a needless step that
+    is easy to get wrong.
+    """
+
+    if value.exists():
+        return value
+    candidate = str(value)
+    separators = {os.sep, os.altsep} - {None, ""}
+    looks_like_path = (
+        any(separator in candidate for separator in separators)
+        or candidate.startswith("~")
+        or candidate.endswith((".jsonl", ".json", ".db", ".zip"))
+    )
+    if looks_like_path:
+        raise SessionMigrateError(f"source path does not exist: {candidate}")
+
+    formats = (source_format,) if source_format else _ID_LOOKUP_FORMATS
+    matches: dict[AgentFormat, Path] = {}
+    for candidate_format in formats:
+        if candidate_format not in _ID_LOOKUP_FORMATS:
+            raise SessionMigrateError(
+                f"{candidate_format.value} sessions are located by ID through "
+                f"`session-migrate transfer {candidate} --from {candidate_format.value}`"
+            )
+        try:
+            normalized = normalized_source_id(candidate_format, candidate)
+            home = default_target_home(candidate_format)
+        except (SessionMigrateError, OSError):
+            continue
+        if not home.exists():
+            continue
+        try:
+            matches[candidate_format] = locate_session(candidate_format, normalized, home)
+        except SessionMigrateError:
+            continue
+
+    if not matches:
+        if source_format:
+            raise SessionMigrateError(
+                f"no {source_format.value} session found for {candidate!r} in "
+                f"{default_target_home(source_format)}"
+            )
+        raise SessionMigrateError(
+            f"{candidate!r} is neither an existing path nor a session ID found in any "
+            "known agent home; pass --format to search one agent, or a file path"
+        )
+    if len(matches) > 1:
+        found = ", ".join(sorted(agent.value for agent in matches))
+        raise SessionMigrateError(
+            f"session ID {candidate!r} matched several agents ({found}); pass --format"
+        )
+    return next(iter(matches.values()))
 
 
 def _add_catalog_query_arguments(parser: argparse.ArgumentParser) -> None:

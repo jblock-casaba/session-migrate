@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections import Counter, deque
@@ -24,11 +25,40 @@ from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Rol
 
 PINNED_CLAUDE_VERSION = "2.1.209"
 TITLE_TYPES = {"custom-title": "customTitle", "ai-title": "aiTitle"}
+_REPEATED_RECORD_METADATA = frozenset({"promptId", "slug"})
+
+# Claude records slash commands, their local output, and background task notices as
+# user-role turns. They are model input but never a prompt the human typed, so importing
+# them verbatim fabricates user turns.
+#
+# Claude itself builds these command envelopes, so a human never types one even when the
+# record is marked `origin.kind == "human"` for having invoked the command.
+COMMAND_ENVELOPE_WRAPPERS: tuple[str, ...] = (
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+)
+
+# Machine-authored notices a human could conceivably quote back, so Claude's own
+# `origin.kind == "human"` marker takes precedence for these.
+NOTIFICATION_WRAPPERS: tuple[str, ...] = ("<task-notification>",)
+
+CONTEXTUAL_USER_WRAPPERS: tuple[str, ...] = (
+    *COMMAND_ENVELOPE_WRAPPERS,
+    *NOTIFICATION_WRAPPERS,
+)
 
 
 def parse(path: Path) -> Session:
     records = list(iter_jsonl(path))
-    selected_records = _active_conversation_records(records)
+    unique_records, duplicate_indices = _deduplicate_records(records)
+    selected_records = _active_conversation_records(unique_records)
     selected = {record.index for record in selected_records}
     selected_session_ids = {
         string(record.value.get("sessionId"))
@@ -126,12 +156,32 @@ def parse(path: Path) -> Session:
             continue
         if role == Role.ASSISTANT:
             model = model or string(message.get("model"))
-        events.extend(_events_from_content(record, role, message.get("content")))
+        marker = (
+            _contextual_user_marker(value, message.get("content")) if role == Role.USER else None
+        )
+        if marker:
+            events.append(
+                Event(
+                    kind=EventKind.CONTEXT,
+                    role=Role.USER,
+                    timestamp=string(value.get("timestamp")),
+                    payload={
+                        "block_type": "claude_injected_user_context",
+                        "context_source": marker,
+                    },
+                    provenance=_provenance(record),
+                )
+            )
+        else:
+            events.extend(_events_from_content(record, role, message.get("content")))
         if value.get("toolUseResult") is not None or value.get("sourceToolAssistantUUID"):
             events.append(_opaque_event(record, "top_level_tool_result_metadata"))
 
     # Non-selected records are accounting-only and cannot affect replay order.
     for record in records:
+        if record.index in duplicate_indices:
+            events.append(_opaque_event(record, "duplicate_record_uuid"))
+            continue
         if record.index in selected:
             continue
         value = record.value
@@ -358,6 +408,47 @@ def project_directory_name(cwd: Path) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", resolved) or "-"
 
 
+def _deduplicate_records(records: list[JsonlRecord]) -> tuple[list[JsonlRecord], set[int]]:
+    unique: list[JsonlRecord] = []
+    by_uuid: dict[str, JsonlRecord] = {}
+    duplicate_indices: set[int] = set()
+    for record in records:
+        record_uuid = string(record.value.get("uuid"))
+        previous = by_uuid.get(record_uuid) if record_uuid else None
+        if previous is not None:
+            # Resume bookkeeping may repeat a UUID with new correlation/display metadata.
+            # Everything else, including role, content, ancestry and flags, must match.
+            values = (previous.value, record.value)
+            valid_metadata = all(
+                value.get(key) is None or isinstance(value[key], str)
+                for value in values
+                for key in _REPEATED_RECORD_METADATA
+            )
+            identities = [
+                json.dumps(
+                    {
+                        key: item
+                        for key, item in value.items()
+                        if key not in _REPEATED_RECORD_METADATA
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for value in values
+            ]
+            if not valid_metadata or identities[0] != identities[1]:
+                raise SessionMigrateError(
+                    "Claude transcript contains a duplicate record UUID "
+                    "with conflicting content or metadata"
+                )
+            duplicate_indices.add(record.index)
+            continue
+        if record_uuid:
+            by_uuid[record_uuid] = record
+        unique.append(record)
+    return unique, duplicate_indices
+
+
 def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord]:
     candidates = [
         record
@@ -384,8 +475,6 @@ def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord
         record_uuid = string(record.value.get("uuid"))
         if not record_uuid:
             continue
-        if record_uuid in by_uuid:
-            raise SessionMigrateError("Claude transcript contains a duplicate record UUID")
         by_uuid[record_uuid] = record
     recorded_leaf = next(
         (
@@ -478,6 +567,29 @@ def _valid_preserved_compaction_back_edge(
             return False
         cursor = string(record.value.get("parentUuid"))
     return cursor == anchor and head in preserved_path
+
+
+def _contextual_user_marker(value: dict[str, Any], content: Any) -> str | None:
+    """Name the injected wrapper when a user-role record is not a real prompt.
+
+    Command envelopes are always Claude's own serialization of an invocation, so they
+    are never a typed prompt. For machine notices, Claude's `origin.kind == "human"`
+    marker wins. Text matching no known wrapper is always kept, because older records
+    predate the origin marker entirely.
+    """
+
+    text = content if isinstance(content, str) else content_text(content)
+    lowered = text.lstrip().lower()
+    for wrapper in COMMAND_ENVELOPE_WRAPPERS:
+        if lowered.startswith(wrapper):
+            return wrapper.strip("<>")
+    origin = value.get("origin")
+    if isinstance(origin, dict) and string(origin.get("kind")) == "human":
+        return None
+    for wrapper in NOTIFICATION_WRAPPERS:
+        if lowered.startswith(wrapper):
+            return wrapper.strip("<>")
+    return None
 
 
 def _events_from_content(record: JsonlRecord, role: Role, content: Any) -> Iterable[Event]:

@@ -654,3 +654,214 @@ def test_transfer_by_catalog_id_exports_virtual_opencode_source(
     assert captured["session_id"] == source.session_id
     assert isinstance(captured["environ"], dict)
     assert captured["environ"]["XDG_DATA_HOME"] == str(data_home.resolve())  # type: ignore[index]
+
+
+CODEX_SOURCE_ID = "019f59bf-bdb9-7c13-9520-33a760237543"
+
+
+def _install_codex_rollout(home: Path, session_id: str) -> Path:
+    """Place a fixture where Codex's own layout puts it."""
+
+    fixture = Path(__file__).parent / "fixtures" / "codex-0.144.4" / "basic.jsonl"
+    rollout = (
+        home / "sessions" / "2026" / "08" / "17" / f"rollout-2026-08-17T13-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_bytes(fixture.read_bytes())
+    return rollout
+
+
+def test_convert_accepts_a_session_id_instead_of_a_path(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "codex"
+    _install_codex_rollout(codex_home, CODEX_SOURCE_ID)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    status = main(
+        [
+            "convert",
+            CODEX_SOURCE_ID,
+            "--to",
+            "copilot",
+            "--output",
+            str(tmp_path / "out.jsonl"),
+            "--cwd",
+            str(tmp_path),
+        ]
+    )
+
+    assert status == 0
+    assert json.loads(capsys.readouterr().out)["source_format"] == "codex"  # type: ignore[attr-defined]
+
+
+def test_import_accepts_a_session_id_instead_of_a_path(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "codex"
+    _install_codex_rollout(codex_home, CODEX_SOURCE_ID)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    status = main(
+        [
+            "import",
+            CODEX_SOURCE_ID,
+            "--to",
+            "claude",
+            "--home",
+            str(tmp_path / "claude-home"),
+            "--dry-run",
+            "--cwd",
+            str(tmp_path),
+        ]
+    )
+
+    assert status == 0
+    assert json.loads(capsys.readouterr().out)["source_format"] == "codex"  # type: ignore[attr-defined]
+
+
+def test_session_id_lookup_reports_actionable_failures(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "codex"
+    _install_codex_rollout(codex_home, CODEX_SOURCE_ID)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+
+    unknown = ["inspect", "6f1b1cf8-0000-4000-8000-000000000000"]
+    assert main(unknown) == 2
+    assert "neither an existing path nor a session ID" in capsys.readouterr().err  # type: ignore[attr-defined]
+
+    # A value that looks like a path must keep reporting a missing path, not a bad ID.
+    assert main(["inspect", str(tmp_path / "absent.jsonl")]) == 2
+    assert "source path does not exist" in capsys.readouterr().err  # type: ignore[attr-defined]
+
+    # An explicit --format scopes the search to that agent's home.
+    assert main(["inspect", CODEX_SOURCE_ID, "--format", "claude"]) == 2
+    assert "no claude session found" in capsys.readouterr().err  # type: ignore[attr-defined]
+
+
+def test_session_id_lookup_still_prefers_an_existing_path(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real file always wins, even when its name is also a valid session ID."""
+
+    codex_home = tmp_path / "codex"
+    _install_codex_rollout(codex_home, CODEX_SOURCE_ID)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.chdir(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "claude-2.1.209" / "basic.jsonl"
+    (tmp_path / CODEX_SOURCE_ID).write_bytes(fixture.read_bytes())
+
+    assert main(["inspect", CODEX_SOURCE_ID, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["format"] == "claude"  # type: ignore[attr-defined]
+
+
+def test_since_last_compaction_flag_trims_and_reports(tmp_path: Path, capsys: object) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "codex-0.144.4" / "basic.jsonl"
+    records = [json.loads(line) for line in fixture.read_text().splitlines() if line.strip()]
+    records.append(
+        {
+            "timestamp": "2026-08-17T13:30:00Z",
+            "type": "compacted",
+            "payload": {
+                "message": "",
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "carried goal"}],
+                    }
+                ],
+            },
+        }
+    )
+    records.append(
+        {
+            "timestamp": "2026-08-17T13:31:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "after compaction"}],
+            },
+        }
+    )
+    source = tmp_path / "compacted.jsonl"
+    source.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    status = main(
+        [
+            "convert",
+            str(source),
+            "--to",
+            "copilot",
+            "--since-last-compaction",
+            "--output",
+            str(tmp_path / "trimmed.jsonl"),
+            "--cwd",
+            str(tmp_path),
+        ]
+    )
+
+    assert status == 0
+    result = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    warning = next(
+        item for item in result["warnings"] if item["code"] == "truncated_to_last_compaction"
+    )
+    assert warning["events_before_boundary"] > 0
+    assert warning["events_carried_forward"] == 1
+
+    written = (tmp_path / "trimmed.jsonl").read_text()
+    assert "carried goal" in written
+    assert "after compaction" in written
+
+
+def test_since_last_compaction_fails_when_there_is_no_boundary(
+    tmp_path: Path, capsys: object
+) -> None:
+    source = tmp_path / "plain.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "timestamp": "2026-08-17T13:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "20000000-0000-4000-8000-000000000000",
+                        "cwd": str(tmp_path),
+                        "cli_version": "0.144.4",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-17T13:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "only turn"}],
+                    },
+                },
+            )
+        )
+        + "\n"
+    )
+
+    status = main(
+        [
+            "convert",
+            str(source),
+            "--to",
+            "copilot",
+            "--since-last-compaction",
+            "--output",
+            str(tmp_path / "trimmed.jsonl"),
+            "--cwd",
+            str(tmp_path),
+        ]
+    )
+
+    assert status == 2
+    assert "no compaction boundary" in capsys.readouterr().err  # type: ignore[attr-defined]
+    assert not (tmp_path / "trimmed.jsonl").exists()

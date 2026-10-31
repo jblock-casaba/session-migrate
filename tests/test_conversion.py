@@ -902,7 +902,7 @@ def test_load_session_rejects_source_change_during_parse(
         load_session(path, AgentFormat.CLAUDE)
 
 
-def test_rejects_paginated_and_expands_replacement_history(tmp_path: Path) -> None:
+def test_rejects_unknown_history_mode_and_expands_replacement_history(tmp_path: Path) -> None:
     base_meta = {
         "timestamp": "2026-08-17T12:00:00Z",
         "type": "session_meta",
@@ -914,11 +914,18 @@ def test_rejects_paginated_and_expands_replacement_history(tmp_path: Path) -> No
             "model_provider": "openai",
         },
     }
-    paginated = json.loads(json.dumps(base_meta))
-    paginated["payload"]["history_mode"] = "paginated"
-    paginated_path = write_jsonl(tmp_path / "paginated.jsonl", [paginated])
+    unknown = json.loads(json.dumps(base_meta))
+    unknown["payload"]["history_mode"] = "sharded"
+    unknown_path = write_jsonl(tmp_path / "unknown.jsonl", [unknown])
     with pytest.raises(SessionMigrateError, match="history mode"):
-        codex.parse(paginated_path)
+        codex.parse(unknown_path)
+
+    lineage = json.loads(json.dumps(base_meta))
+    lineage["payload"]["history_mode"] = "paginated"
+    lineage["payload"]["history_base"] = {"thread_id": "33333333-3333-4333-8333-333333333333"}
+    lineage_path = write_jsonl(tmp_path / "lineage.jsonl", [lineage])
+    with pytest.raises(SessionMigrateError, match="history_base"):
+        codex.parse(lineage_path)
 
     replacement_path = write_jsonl(
         tmp_path / "replacement.jsonl",
@@ -964,6 +971,277 @@ def test_rejects_paginated_and_expands_replacement_history(tmp_path: Path) -> No
     )
     assert artifact.dropped == {"compaction:replacement_history_expanded": 1}
     assert "visible pre-compaction transcript" in artifact.warnings[0]["message"]
+
+
+def test_legacy_filters_injected_context_using_ui_messages(tmp_path: Path) -> None:
+    """Legacy rollouts inject the same environment state; `user_message` is the truth."""
+
+    injected = "<environment_context>\n  <cwd>/work</cwd>\n</environment_context>"
+    path = write_jsonl(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "timestamp": "2026-08-17T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "cwd": str(tmp_path),
+                    "cli_version": "0.144.4",
+                    "history_mode": "legacy",
+                },
+            },
+            {
+                "timestamp": "2026-08-17T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": injected,
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-08-17T12:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "ship it"},
+            },
+            {
+                "timestamp": "2026-08-17T12:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ship it"}],
+                },
+            },
+        ],
+    )
+    session = codex.parse(path)
+
+    messages = [event for event in session.events if event.kind == EventKind.MESSAGE]
+    assert [(event.role, event.text) for event in messages] == [(Role.USER, "ship it")]
+    assert [
+        event.payload["context_source"]
+        for event in session.events
+        if event.payload.get("block_type") == "codex_injected_user_context"
+    ] == ["environment_context"]
+
+
+def test_ui_confirmed_prompt_is_never_reclassified(tmp_path: Path) -> None:
+    """A human who literally pastes a wrapper still gets their prompt imported."""
+
+    pasted = "<environment_context>\n  <cwd>/work</cwd>\n</environment_context>"
+    path = write_jsonl(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "timestamp": "2026-08-17T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "cwd": str(tmp_path),
+                    "cli_version": "0.144.4",
+                },
+            },
+            {
+                "timestamp": "2026-08-17T12:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": pasted},
+            },
+            {
+                "timestamp": "2026-08-17T12:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": pasted}],
+                },
+            },
+        ],
+    )
+    session = codex.parse(path)
+
+    messages = [event for event in session.events if event.kind == EventKind.MESSAGE]
+    assert [(event.role, event.text) for event in messages] == [(Role.USER, pasted)]
+
+
+def paginated_record(
+    ordinal: int,
+    record_type: str,
+    payload: dict[str, object],
+    *,
+    timestamp: str = "2026-08-17T12:00:00Z",
+) -> dict[str, object]:
+    return {
+        "timestamp": timestamp,
+        "ordinal": ordinal,
+        "type": record_type,
+        "payload": payload,
+    }
+
+
+def paginated_meta(tmp_path: Path, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "timestamp": "2026-08-17T12:00:00Z",
+        "cwd": str(tmp_path),
+        "cli_version": "0.151.0",
+        "model_provider": "openai",
+        "history_mode": "paginated",
+    }
+    payload.update(overrides)
+    return paginated_record(0, "session_meta", payload)
+
+
+def user_message_item(ordinal: int, text: str) -> dict[str, object]:
+    return paginated_record(
+        ordinal,
+        "event_msg",
+        {
+            "type": "item_completed",
+            "item": {"type": "UserMessage", "content": [{"type": "text", "text": text}]},
+        },
+    )
+
+
+def user_response_item(ordinal: int, text: str) -> dict[str, object]:
+    return paginated_record(
+        ordinal,
+        "response_item",
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    )
+
+
+def test_paginated_filters_injected_context_and_keeps_real_prompts(tmp_path: Path) -> None:
+    """Codex injects environment state as user-role items; they must not become prompts."""
+
+    path = write_jsonl(
+        tmp_path / "paginated.jsonl",
+        [
+            paginated_meta(tmp_path),
+            user_response_item(1, "<recommended_plugins>\nAirtable\n</recommended_plugins>"),
+            user_response_item(
+                2, "<environment_context>\n  <cwd>/work</cwd>\n</environment_context>"
+            ),
+            user_response_item(3, "# AGENTS.md instructions for /work\n\n<INSTRUCTIONS>\n"),
+            user_response_item(4, "Return exactly OK."),
+            user_message_item(5, "Return exactly OK."),
+            paginated_record(
+                6,
+                "response_item",
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "OK"}],
+                },
+            ),
+            paginated_record(
+                7,
+                "event_msg",
+                {
+                    "type": "item_completed",
+                    "item": {"type": "AgentMessage", "content": [{"type": "Text", "text": "OK"}]},
+                },
+            ),
+        ],
+    )
+    session = codex.parse(path)
+
+    messages = [event for event in session.events if event.kind == EventKind.MESSAGE]
+    assert [(event.role, event.text) for event in messages] == [
+        (Role.USER, "Return exactly OK."),
+        (Role.ASSISTANT, "OK"),
+    ]
+    injected = [
+        event.payload["context_source"]
+        for event in session.events
+        if event.payload.get("block_type") == "codex_injected_user_context"
+    ]
+    assert injected == ["recommended_plugins", "environment_context", "agents_md_instructions"]
+
+
+def test_paginated_keeps_unrecognized_and_image_prefixed_user_text(tmp_path: Path) -> None:
+    """Sub-agent instructions have no UI item, and images prefix genuine prompts."""
+
+    attachment = '<image name=[Image #1] path="/tmp/shot.png"></image>Why is this broken?'
+    path = write_jsonl(
+        tmp_path / "paginated.jsonl",
+        [
+            paginated_meta(tmp_path, thread_source="subagent"),
+            user_response_item(1, "Investigate the failing parser and report back."),
+            user_response_item(2, attachment),
+            user_message_item(3, "Why is this broken?"),
+        ],
+    )
+    session = codex.parse(path)
+
+    messages = [event for event in session.events if event.kind == EventKind.MESSAGE]
+    assert [(event.role, event.text) for event in messages] == [
+        (Role.USER, "Investigate the failing parser and report back."),
+        (Role.USER, attachment),
+    ]
+    assert not [
+        event for event in session.events if event.payload.get("ui_only_projection") is True
+    ]
+
+
+def test_paginated_maps_context_compaction_items(tmp_path: Path) -> None:
+    path = write_jsonl(
+        tmp_path / "paginated.jsonl",
+        [
+            paginated_meta(tmp_path),
+            user_response_item(1, "hello"),
+            user_message_item(2, "hello"),
+            paginated_record(
+                3,
+                "event_msg",
+                {"type": "item_completed", "item": {"type": "ContextCompaction", "id": "c1"}},
+            ),
+            paginated_record(4, "compacted", {"message": "summary"}),
+        ],
+    )
+    session = codex.parse(path)
+
+    assert [event.kind for event in session.events] == [
+        EventKind.MESSAGE,
+        EventKind.COMPACTION,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("records", "match"),
+    [
+        ("missing", "missing an integer 'ordinal'"),
+        ("truncated", "starts at ordinal 392"),
+        ("decreasing", "ordinals decrease"),
+    ],
+)
+def test_paginated_ordinals_fail_closed(tmp_path: Path, records: str, match: str) -> None:
+    """A complete, ordered ordinal chain is the only proof this file is the whole thread."""
+
+    written: list[dict[str, object]] = [paginated_meta(tmp_path)]
+    if records == "missing":
+        record = user_response_item(1, "hi")
+        record.pop("ordinal")
+        written.append(record)
+    elif records == "truncated":
+        # Real history_base continuations start mid-stream, so earlier turns are absent.
+        written[0]["ordinal"] = 392
+        written.append(user_response_item(393, "hi"))
+    else:
+        written.append(user_response_item(2, "hi"))
+        written.append(user_response_item(1, "out of order"))
+    path = write_jsonl(tmp_path / "paginated.jsonl", written)
+    with pytest.raises(SessionMigrateError, match=match):
+        codex.parse(path)
 
 
 def test_codex_mixed_ui_messages_recover_only_unmatched_fallback(tmp_path: Path) -> None:
@@ -1356,3 +1634,282 @@ def test_codex_fixture_semantics_survive_claude_round_trip(tmp_path: Path) -> No
     reparsed = claude.parse(converted)
 
     assert semantic_signature(source, omit={EventKind.COMPACTION}) == semantic_signature(reparsed)
+
+
+def compacted_session(tmp_path: Path, *, carried: bool = True) -> Path:
+    """A rollout with two compaction boundaries and turns after each."""
+
+    replacement = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "original goal"}],
+        },
+        {"type": "compaction", "encrypted_content": "opaque-provider-state"},
+    ]
+    return write_jsonl(
+        tmp_path / "compacted.jsonl",
+        [
+            {
+                "timestamp": "2026-08-17T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "cwd": str(tmp_path),
+                    "cli_version": "0.144.4",
+                },
+            },
+            {
+                "timestamp": "2026-08-17T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ancient history"}],
+                },
+            },
+            {
+                "timestamp": "2026-08-17T12:00:02Z",
+                "type": "compacted",
+                "payload": {"message": "", "replacement_history": replacement},
+            },
+            {
+                "timestamp": "2026-08-17T12:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "middle history"}],
+                },
+            },
+            {
+                "timestamp": "2026-08-17T12:00:04Z",
+                "type": "compacted",
+                "payload": (
+                    {"message": "", "replacement_history": replacement}
+                    if carried
+                    else {"message": ""}
+                ),
+            },
+            {
+                "timestamp": "2026-08-17T12:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "recent answer"}],
+                },
+            },
+        ],
+    )
+
+
+def test_truncation_keeps_the_last_window_the_agent_would_resume_with(tmp_path: Path) -> None:
+    session = codex.parse(compacted_session(tmp_path))
+    assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [
+        "ancient history",
+        "middle history",
+        "recent answer",
+    ]
+
+    trimmed, stats = conversion.truncate_to_last_compaction(session)
+    # The carried anchor replaces every turn the agent had already compacted away.
+    assert [event.text for event in trimmed.events if event.kind == EventKind.MESSAGE] == [
+        "original goal",
+        "recent answer",
+    ]
+    # The encrypted summary survives only as a counted placeholder, never as text.
+    assert [
+        event.payload.get("source_item_type")
+        for event in trimmed.events
+        if event.kind == EventKind.OPAQUE
+    ] == ["compaction"]
+    assert stats["events_carried_forward"] == 2
+    assert stats["events_after_boundary"] == 1
+    assert stats["events_before_boundary"] > 0
+
+
+def test_truncation_without_replacement_history_keeps_later_events(tmp_path: Path) -> None:
+    session = codex.parse(compacted_session(tmp_path, carried=False))
+    trimmed, stats = conversion.truncate_to_last_compaction(session)
+
+    assert [event.text for event in trimmed.events if event.kind == EventKind.MESSAGE] == [
+        "recent answer"
+    ]
+    assert stats["events_carried_forward"] == 0
+
+
+def test_truncation_is_a_no_op_without_compaction(tmp_path: Path) -> None:
+    path = write_jsonl(
+        tmp_path / "plain.jsonl",
+        [
+            {
+                "timestamp": "2026-08-17T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "22222222-2222-4222-8222-222222222222", "cwd": str(tmp_path)},
+            },
+            {
+                "timestamp": "2026-08-17T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "only turn"}],
+                },
+            },
+        ],
+    )
+    session = codex.parse(path)
+    trimmed, stats = conversion.truncate_to_last_compaction(session)
+
+    assert stats == {}
+    assert trimmed.events == session.events
+
+
+def test_truncated_conversion_carries_the_anchor_into_the_target(tmp_path: Path) -> None:
+    session = codex.parse(compacted_session(tmp_path))
+    trimmed, _ = conversion.truncate_to_last_compaction(session)
+    artifact = convert_session(
+        trimmed,
+        ConversionOptions(target_format=AgentFormat.COPILOT, cwd=tmp_path),
+    )
+    records = [json.loads(line) for line in artifact.native_bytes.decode().splitlines() if line]
+
+    assert [
+        record["data"]["content"] for record in records if record["type"] == "user.message"
+    ] == ["original goal"]
+
+
+def test_truncation_carries_a_plaintext_claude_summary(tmp_path: Path) -> None:
+    """Claude records its summary as readable text, unlike Codex's encrypted state."""
+
+    cwd = str(tmp_path)
+    summary = "Summary: the earlier work established the parser contract."
+    boundary = {
+        "type": "system",
+        "subtype": "compact_boundary",
+        "uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "parentUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+        "sessionId": "11111111-1111-4111-8111-111111111111",
+        "timestamp": "2026-08-17T12:00:02Z",
+        "cwd": cwd,
+        "version": "2.1.209",
+        "compactMetadata": {"trigger": "auto"},
+    }
+    summary_record = claude_record(
+        "user",
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        summary,
+        cwd=cwd,
+    )
+    summary_record["isCompactSummary"] = True
+    path = write_jsonl(
+        tmp_path / "claude.jsonl",
+        [
+            claude_record(
+                "user", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", None, "ancient history", cwd=cwd
+            ),
+            boundary,
+            summary_record,
+            claude_record(
+                "user",
+                "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "what next?",
+                cwd=cwd,
+            ),
+            claude_record(
+                "assistant",
+                "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                [{"type": "text", "text": "continuing"}],
+                cwd=cwd,
+            ),
+        ],
+    )
+    session = claude.parse(path)
+    trimmed, stats = conversion.truncate_to_last_compaction(session)
+
+    assert stats["compaction_summary_carried"] == 1
+    assert [event.text for event in trimmed.events if event.kind == EventKind.COMPACTION] == [
+        summary
+    ]
+    assert [event.text for event in trimmed.events if event.kind == EventKind.MESSAGE] == [
+        "what next?",
+        "continuing",
+    ]
+
+    artifact = convert_session(
+        trimmed,
+        ConversionOptions(target_format=AgentFormat.COPILOT, cwd=tmp_path),
+    )
+    records = [json.loads(line) for line in artifact.native_bytes.decode().splitlines() if line]
+    assert [
+        record["data"]["summaryContent"]
+        for record in records
+        if record["type"] == "session.compaction_complete"
+    ] == [summary]
+
+
+def test_claude_filters_slash_commands_and_task_notifications(tmp_path: Path) -> None:
+    """Claude logs its own command echoes and notices as user-role turns."""
+
+    cwd = str(tmp_path)
+    records = []
+    parent = None
+    for uid, text, origin in (
+        ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "<command-name>/compact</command-name>", None),
+        (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+            "<local-command-stdout>Compacted</local-command-stdout>",
+            None,
+        ),
+        (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+            "<task-notification>\n<task-id>x</task-id>\n</task-notification>",
+            None,
+        ),
+        ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "please fix the parser", {"kind": "human"}),
+    ):
+        record = claude_record("user", uid, parent, text, cwd=cwd)
+        if origin:
+            record["origin"] = origin
+        records.append(record)
+        parent = uid
+    session = claude.parse(write_jsonl(tmp_path / "claude.jsonl", records))
+
+    assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [
+        "please fix the parser"
+    ]
+    assert [
+        event.payload["context_source"]
+        for event in session.events
+        if event.payload.get("block_type") == "claude_injected_user_context"
+    ] == ["command-name", "local-command-stdout", "task-notification"]
+
+
+def test_claude_human_origin_wins_for_notices_but_not_command_envelopes(
+    tmp_path: Path,
+) -> None:
+    """A quoted notice is a prompt; a slash-command envelope never is."""
+
+    cwd = str(tmp_path)
+    invoked = claude_record(
+        "user",
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+        None,
+        "<command-name>/doctor</command-name>",
+        cwd=cwd,
+    )
+    invoked["origin"] = {"kind": "human"}
+    invoked_session = claude.parse(write_jsonl(tmp_path / "invoked.jsonl", [invoked]))
+    # Claude builds this envelope itself, so human origin means "ran a command".
+    assert not [e for e in invoked_session.events if e.kind == EventKind.MESSAGE]
+
+    pasted = "<task-notification>look at this notification I got</task-notification>"
+    record = claude_record("user", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", None, pasted, cwd=cwd)
+    record["origin"] = {"kind": "human"}
+    session = claude.parse(write_jsonl(tmp_path / "claude.jsonl", [record]))
+
+    assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [pasted]

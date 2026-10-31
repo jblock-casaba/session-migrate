@@ -102,6 +102,17 @@ OMP reset boundaries intentionally hide earlier model context. The manifest
 reports `omp_pre_reset_entry` instead of resurrecting that history. A generated
 session resumes with `omp --resume NEW_UUID` from its recorded project.
 
+## Claude duplicate record UUID
+
+Repeated copies of one record are accepted when they match except for
+`promptId`/`slug` bookkeeping, and are reported as
+`opaque:duplicate_record_uuid`. The message or tool exchange is replayed once.
+
+If the error mentions conflicting content or metadata, the same UUID identifies
+different records. The reader cannot safely choose between different messages,
+parent links, or flags. Keep the source intact; do not remove the duplicate-ID
+guard or blindly delete records to bypass it.
+
 ## Codex active/archive duplicate
 
 The same UUID exists in more than one native path. Use the catalog to select an
@@ -261,12 +272,17 @@ separately authenticated Devin installation; session-migrate never copies
 credentials. See the [Hermes](hermes-format.md),
 [MastraCode](mastracode-format.md), and [Devin](devin-format.md) format notes.
 
-## Codex paginated or history-base source
+## Codex history-base fork source
 
-These lineage modes are recognized but unsupported. `--format codex` cannot
-bypass the guard. The safe root-paginated subset still needs ordinal,
-contextual-user, compaction/rollback/inter-agent, and lineage semantics before
-it can be enabled.
+`history_base` lineage is recognized but unsupported: the referenced base thread
+lives in another file, so importing this one alone would silently drop the
+earlier turns. `--format codex` cannot bypass the guard.
+
+Paginated rollouts are supported. A paginated file is still rejected when its
+`ordinal` chain cannot prove completeness — a missing or non-integer ordinal, a
+decreasing ordinal, or a first ordinal other than zero all mean this file is
+only part of the thread. Real `history_base` continuations start mid-stream and
+fail this check independently.
 
 ## Claude sidechain/subagent
 

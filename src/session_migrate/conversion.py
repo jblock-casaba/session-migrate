@@ -46,7 +46,7 @@ from session_migrate.jsonl import (
     file_snapshot,
     write_private_atomic,
 )
-from session_migrate.model import AgentFormat, Session, TargetFormat
+from session_migrate.model import AgentFormat, EventKind, Session, TargetFormat
 
 OPENCODE_HOME_UNSUPPORTED = (
     "--home is not supported for OpenCode imports; control OpenCode's normal HOME/XDG "
@@ -270,6 +270,43 @@ def load_devin_session(session_id: str, *, source_home: Path) -> Session:
     native_id = devin.normalized_session_id(session_id)
     session = devin.parse_session(devin.database_path(source_home), native_id)
     return replace(session, source_path=Path(f"devin:{native_id}"))
+
+
+def truncate_to_last_compaction(session: Session) -> tuple[Session, dict[str, int]]:
+    """Reduce a session to the effective window its agent would itself resume with.
+
+    A migrated transcript replays every turn the source ever held, including history the
+    source agent had already compacted away, so a long session can exceed the target
+    model's context window many times over. Keeping only the last compaction boundary
+    reproduces what the source actually carried forward: its summary where one is
+    readable, the plaintext messages from its replacement history, then every later
+    event.
+    """
+
+    boundary = None
+    for index, event in enumerate(session.events):
+        if event.kind == EventKind.COMPACTION:
+            boundary = index
+    if boundary is None:
+        return session, {}
+
+    compaction = session.events[boundary]
+    carried = compaction.payload.get("carried_events")
+    carried = tuple(carried) if isinstance(carried, tuple | list) else ()
+    after = session.events[boundary + 1 :]
+    # Keep the boundary itself. Claude records its summary there as plaintext, and a
+    # summary-less boundary costs nothing beyond a counted omission at write time.
+    kept = (*carried, compaction, *after)
+    stats = {
+        "events_before_boundary": boundary,
+        "events_carried_forward": len(carried),
+        "events_after_boundary": len(after),
+    }
+    if compaction.text:
+        stats["compaction_summary_carried"] = 1
+    elif compaction.payload.get("replacement_history_expanded") and not carried:
+        stats["carried_history_unavailable"] = 1
+    return replace(session, events=kept), stats
 
 
 def convert_session(session: Session, options: ConversionOptions) -> ConversionArtifact:
@@ -540,6 +577,11 @@ def convert_session(session: Session, options: ConversionOptions) -> ConversionA
             message = (
                 "Codex encrypted compaction state cannot be decoded by Claude; "
                 "the visible pre-compaction transcript was retained instead"
+            )
+        elif kind.startswith("opaque:copilot_unrecognized_event:"):
+            message = (
+                "this Copilot event type is newer than session-migrate recognizes; it was "
+                "skipped without copying its payload"
             )
         elif kind == "message:ui_only_projection":
             message = (
