@@ -47,6 +47,7 @@ from session_migrate.conversion import (
 )
 from session_migrate.discovery import locate_session, normalized_source_id
 from session_migrate.errors import SessionMigrateError
+from session_migrate.formats import antigravity
 from session_migrate.inspection import inspect_session
 from session_migrate.model import AgentFormat, TargetFormat
 
@@ -589,13 +590,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "--since-last-compaction found no compaction boundary in this "
                         "session; the full transcript is already its effective window"
                     )
+            target_cli_version = args.target_cli_version
+            if (
+                target_format == TargetFormat.ANTIGRAVITY
+                and args.command != "convert"
+                and not target_cli_version
+            ):
+                # Write the store layout of the pinned build that receives the import.
+                target_cli_version = antigravity.installed_pinned_version(args.target_cli)
             artifact = convert_session(
                 session,
                 ConversionOptions(
                     target_format=target_format,
                     session_id=args.session_id,
                     cwd=args.cwd,
-                    target_cli_version=args.target_cli_version,
+                    target_cli_version=target_cli_version,
                     model_provider=args.model_provider,
                     model=args.model,
                 ),
@@ -777,7 +786,10 @@ def _add_conversion_arguments(
     )
     parser.add_argument(
         "--target-cli-version",
-        help="metadata version only; the writer schema remains pinned",
+        help=(
+            "metadata version only; the writer schema remains pinned (for Antigravity, "
+            "selects a pinned build's store layout)"
+        ),
     )
     parser.add_argument(
         "--target-cli",

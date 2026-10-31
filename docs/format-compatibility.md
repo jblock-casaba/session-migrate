@@ -22,7 +22,7 @@ to separately installed host binaries:
 | Oh My Pi source and target | `18.0.5` |
 | OpenCode source and target | `1.17.20` |
 | GitHub Copilot CLI source and target | `1.0.70` |
-| Antigravity CLI source and target | `1.1.16` |
+| Antigravity CLI source and target | `1.1.16` (Linux x86_64), `1.4.12` (macOS arm64) |
 | Cursor Agent experimental text adapter | `2026.03.20-44cb435` |
 | Mistral Vibe source and target | `2.24.3` |
 | Muse Code source and target | `0.2.1 (0.2.1-R1215.1)` |

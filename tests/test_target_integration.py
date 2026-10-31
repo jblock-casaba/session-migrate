@@ -420,7 +420,9 @@ def test_antigravity_version_label_cannot_bypass_pinned_native_import(
         return Path("agy")
 
     monkeypatch.setattr(antigravity, "verify_pinned_cli", verify)
-    with pytest.raises(SessionMigrateError, match="requires target metadata version 1.1.16"):
+    with pytest.raises(
+        SessionMigrateError, match=r"requires a pinned target version \(1.1.16, 1.4.12\)"
+    ):
         install_antigravity_artifact(
             artifact,
             target_home=tmp_path / "antigravity-cli",

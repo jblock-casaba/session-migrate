@@ -559,7 +559,10 @@ def convert_session(session: Session, options: ConversionOptions) -> ConversionA
             timestamp=timestamp,
         )
     pinned_target = _pinned_target_version(target_format)
-    if target_version != pinned_target:
+    if target_version != pinned_target and not (
+        target_format == TargetFormat.ANTIGRAVITY
+        and target_version in antigravity.SUPPORTED_ANTIGRAVITY_VERSIONS
+    ):
         warnings.append(
             {
                 "code": "unvalidated_target_version",
@@ -914,11 +917,11 @@ def install_antigravity_artifact(
 
     if artifact.target_format != TargetFormat.ANTIGRAVITY:
         raise SessionMigrateError("Antigravity installation requires an Antigravity artifact")
-    if artifact.target_cli_version != antigravity.PINNED_ANTIGRAVITY_VERSION:
+    if artifact.target_cli_version not in antigravity.SUPPORTED_ANTIGRAVITY_VERSIONS:
         raise SessionMigrateError(
-            "automatic Antigravity import requires target metadata version "
-            f"{antigravity.PINNED_ANTIGRAVITY_VERSION}; convert-only artifacts may opt "
-            "into unvalidated metadata versions"
+            "automatic Antigravity import requires a pinned target version ("
+            + ", ".join(sorted(antigravity.SUPPORTED_ANTIGRAVITY_VERSIONS))
+            + "); convert-only artifacts may opt into unvalidated metadata versions"
         )
     native_path, manifest_path = target_import_paths(artifact, target_home)
     ensure_target_paths_available(manifest_path)
@@ -933,6 +936,7 @@ def install_antigravity_artifact(
             target_cli=target_cli,
             dry_run=True,
             environ=environ,
+            cli_version=artifact.target_cli_version,
         )
         if installed.conversation_path != native_path:
             raise SessionMigrateError("Antigravity installer resolved an unexpected target path")
@@ -956,6 +960,7 @@ def install_antigravity_artifact(
             target_home=target_home,
             target_cli=target_cli,
             environ=environ,
+            cli_version=artifact.target_cli_version,
         )
         install_succeeded = True
         if installed.conversation_path != native_path:

@@ -414,3 +414,193 @@ def test_exact_binary_gate_rejects_unpinned_executable(tmp_path: Path) -> None:
 
     with pytest.raises(SessionMigrateError, match="binary mismatch"):
         antigravity.verify_pinned_cli(executable)
+
+
+# The picker index exactly as Antigravity 1.4.12 creates it.
+AGY_1412_SUMMARY_DDL = (
+    "CREATE TABLE `conversation_summaries` (`conversation_id` text,`title` text NOT NULL "
+    'DEFAULT "",`preview` text NOT NULL DEFAULT "",`step_count` integer NOT NULL DEFAULT 0,'
+    "`last_modified_time` datetime NOT NULL,`workspace_uris` text NOT NULL,`status` text NOT "
+    'NULL DEFAULT "",`source` text NOT NULL DEFAULT "",`project_id` text NOT NULL DEFAULT "",'
+    '`agent_name` text NOT NULL DEFAULT "",`parent_conversation_id` text NOT NULL DEFAULT "",'
+    '`nesting_depth` integer NOT NULL DEFAULT 0,`battle_id` text NOT NULL DEFAULT "",'
+    '`winning_conversation_id` text NOT NULL DEFAULT "",`not_fully_idle` numeric NOT NULL '
+    "DEFAULT false,`killed` numeric NOT NULL DEFAULT false,`last_user_input_time` datetime NOT "
+    "NULL,`last_user_input_step_index` integer NOT NULL DEFAULT -1,`app_data_dir` text NOT "
+    'NULL DEFAULT "",`raw_summary` blob,`group_id` text NOT NULL DEFAULT "",PRIMARY KEY '
+    "(`conversation_id`));"
+    "CREATE INDEX `idx_conversation_summaries_last_modified_time` ON "
+    "`conversation_summaries`(`last_modified_time`);"
+    "CREATE INDEX `idx_conversation_summaries_last_user_input_time` ON "
+    "`conversation_summaries`(`last_user_input_time`);"
+    "PRAGMA user_version=3;"
+)
+
+
+def serialized_1412(tmp_path: Path) -> bytes:
+    data, _ = antigravity.serialize(
+        portable_session(tmp_path),
+        session_id=TARGET_ID,
+        trajectory_id=TRAJECTORY_ID,
+        cwd=tmp_path,
+        cli_version=antigravity.ANTIGRAVITY_1412_VERSION,
+        timestamp="2026-08-20T12:00:00.250000Z",
+    )
+    return data
+
+
+def database_header(data: bytes, tmp_path: Path) -> tuple[int, list[int]]:
+    path = tmp_path / "inspect.db"
+    path.write_bytes(data)
+    with sqlite3.connect(path) as db:
+        user_version = db.execute("PRAGMA user_version").fetchone()[0]
+        blob = db.execute("SELECT data FROM trajectory_metadata_blob").fetchone()[0]
+    path.unlink()
+    return user_version, [field.number for field in antigravity._decode_message(blob)]
+
+
+def test_default_writer_keeps_the_1116_layout(tmp_path: Path) -> None:
+    assert database_header(serialized(tmp_path), tmp_path) == (0, [2, 6, 18])
+
+
+def test_1412_writer_records_schema_version_and_workspace(tmp_path: Path) -> None:
+    data = serialized_1412(tmp_path)
+    path = tmp_path / f"{TARGET_ID}.db"
+    path.write_bytes(data)
+
+    parsed = antigravity.parse(path)
+    with sqlite3.connect(path) as db:
+        blob = db.execute("SELECT data FROM trajectory_metadata_blob").fetchone()[0]
+    fields = {field.number: field.value for field in antigravity._decode_message(blob)}
+    workspace = {field.number: field.value for field in antigravity._decode_message(fields[1])}
+    created = {field.number: field.value for field in antigravity._decode_message(fields[2])}
+
+    # Antigravity 1.4.12 migrates user_version 0 by discarding this metadata.
+    assert database_header(data, tmp_path)[0] == 1
+    assert workspace == {1: tmp_path.as_uri().encode(), 3: b""}
+    assert fields[7] == tmp_path.as_uri().encode()
+    assert created[2] == 250_000_000
+    assert parsed.started_at == "2026-08-20T12:00:00.250000Z"
+    assert event_signature(parsed.events) == event_signature(portable_session(tmp_path).events)
+
+
+def test_1412_install_writes_current_summary_and_annotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pinned: list[object] = []
+    monkeypatch.setattr(
+        antigravity,
+        "verify_pinned_cli",
+        lambda *args, **kwargs: pinned.append(kwargs.get("version")) or Path("agy"),
+    )
+    target_home = tmp_path / "agy-home" / ".gemini" / "antigravity-cli"
+    target_home.mkdir(parents=True)
+    with sqlite3.connect(target_home / "conversation_summaries.db") as db:
+        db.executescript(AGY_1412_SUMMARY_DDL)
+
+    installed = antigravity.install_database(
+        serialized_1412(tmp_path),
+        session_id=TARGET_ID,
+        cwd=tmp_path,
+        timestamp="2026-08-20T12:00:00Z",
+        title='Quoted "title" ✓',
+        target_home=target_home,
+        cli_version=antigravity.ANTIGRAVITY_1412_VERSION,
+    )
+    with sqlite3.connect(installed.summaries_path) as db:
+        summary = db.execute(
+            "SELECT title,status,source,raw_summary,group_id,app_data_dir "
+            "FROM conversation_summaries WHERE conversation_id=?",
+            (TARGET_ID,),
+        ).fetchone()
+
+    assert pinned == [antigravity.ANTIGRAVITY_1412_VERSION]
+    assert summary == (
+        'Quoted "title" ✓',
+        "CASCADE_RUN_STATUS_IDLE",
+        "",
+        None,
+        "",
+        "antigravity-cli",
+    )
+    assert installed.annotation_path == target_home / "annotations" / f"{TARGET_ID}.pbtxt"
+    assert installed.annotation_path.read_bytes() == (b'title:"Quoted \\"title\\" \\342\\234\\223"')
+    assert stat.S_IMODE(installed.annotation_path.stat().st_mode) == 0o600
+    with pytest.raises(SessionMigrateError, match="already exists"):
+        antigravity.install_database(
+            serialized_1412(tmp_path),
+            session_id=TARGET_ID,
+            cwd=tmp_path,
+            timestamp="2026-08-20T12:00:00Z",
+            title=None,
+            target_home=target_home,
+            cli_version=antigravity.ANTIGRAVITY_1412_VERSION,
+            dry_run=True,
+        )
+
+
+def test_1412_install_creates_a_current_picker_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(antigravity, "verify_pinned_cli", lambda *args, **kwargs: Path("agy"))
+    target_home = tmp_path / "antigravity-cli"
+
+    installed = antigravity.install_database(
+        serialized_1412(tmp_path),
+        session_id=TARGET_ID,
+        cwd=tmp_path,
+        timestamp="2026-08-20T12:00:00Z",
+        title=None,
+        target_home=target_home,
+        cli_version=antigravity.ANTIGRAVITY_1412_VERSION,
+    )
+    with sqlite3.connect(installed.summaries_path) as db:
+        columns = [row[1] for row in db.execute("PRAGMA table_info(conversation_summaries)")]
+        user_version = db.execute("PRAGMA user_version").fetchone()[0]
+
+    assert columns[-2:] == ["raw_summary", "group_id"]
+    assert user_version == 3
+    assert installed.annotation_path.read_bytes() == b'title:"Imported conversation"'
+
+
+@pytest.mark.parametrize(
+    ("index_version", "install_version"),
+    [("1.1.16", "1.4.12"), ("1.4.12", "1.1.16")],
+)
+def test_install_refuses_a_picker_index_of_another_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, index_version: str, install_version: str
+) -> None:
+    monkeypatch.setattr(antigravity, "verify_pinned_cli", lambda *args, **kwargs: Path("agy"))
+    target_home = tmp_path / "antigravity-cli"
+    target_home.mkdir()
+    antigravity._ensure_summary_database(target_home / "conversation_summaries.db", index_version)
+    data = serialized_1412(tmp_path) if install_version == "1.4.12" else serialized(tmp_path)
+
+    for dry_run in (True, False):
+        with pytest.raises(SessionMigrateError, match=f"does not match pinned {install_version}"):
+            antigravity.install_database(
+                data,
+                session_id=TARGET_ID,
+                cwd=tmp_path,
+                timestamp="2026-08-20T12:00:00Z",
+                title=None,
+                target_home=target_home,
+                cli_version=install_version,
+                dry_run=dry_run,
+            )
+    assert not (target_home / "conversations").exists()
+    assert not (target_home / "annotations").exists()
+
+
+def test_binary_gate_names_every_pinned_build_and_reports_none_installed(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "agy"
+    executable.write_bytes(b"not a pinned Antigravity binary")
+    os.chmod(executable, 0o700)
+
+    with pytest.raises(SessionMigrateError, match="Linux x86_64 1.1.16 or macOS arm64 1.4.12"):
+        antigravity.verify_pinned_cli(executable)
+    with pytest.raises(SessionMigrateError, match=r"exact macOS arm64 1\.4\.12 build$"):
+        antigravity.verify_pinned_cli(executable, version="1.4.12")
+    assert antigravity.installed_pinned_version(executable) is None

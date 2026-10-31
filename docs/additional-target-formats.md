@@ -10,7 +10,7 @@ and same-format portable-rewrite targets in `session-migrate` 0.9.0.
 | Oh My Pi | `18.0.5` | Write native fixed-title-slot v3 JSONL | Stable pinned adapter |
 | OpenCode | `1.17.20` | Official `export`/`import` CLI | Stable pinned adapter |
 | GitHub Copilot CLI | `1.0.70` | Write public session-event schema | Stable pinned adapter |
-| Antigravity CLI | `1.1.16` | Clean-room SQLite/protobuf DB | Stable version-pinned adapter |
+| Antigravity CLI | `1.1.16`, `1.4.12` | Clean-room SQLite/protobuf DB | Stable version-pinned adapter |
 | Cursor Agent | `2026.03.20-44cb435` | Clean-room content-addressed SQLite/protobuf graph | Experimental, text only |
 | Mistral Vibe | `2.24.3` | Write official two-file local session shape | Stable pinned adapter |
 | Muse Code | `0.2.1` | Write durable native event stream | Stable pinned adapter |

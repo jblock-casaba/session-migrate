@@ -142,10 +142,13 @@ migrator artifact is written.
 
 ## Antigravity binary mismatch
 
-Automatic Antigravity install supports exact `agy 1.1.16`. A metadata override
-cannot bypass the binary version/digest gate. Install the pinned build or use
-`convert` to inspect an artifact without native installation. Later builds need
-a new observed-schema/native-oracle release.
+Automatic Antigravity install supports the exact Linux x86_64 `agy 1.1.16` and
+macOS arm64 `agy 1.4.12` builds, identified by size and SHA-256. A metadata
+override cannot bypass the binary version/digest gate. Install a pinned build or
+use `convert` to inspect an artifact without native installation. Other builds,
+including later releases and other platforms of a pinned version, need a new
+observed-schema/native-oracle validation; see
+[Antigravity format](antigravity-format.md#antigravity-1412-macos-arm64).
 
 Antigravity source files are:
 

@@ -30,7 +30,7 @@ pytest and Ruff are development dependencies locked by `uv.lock`.
 | `src/session_migrate/formats/omp.py` | Oh My Pi 18.0.5 title-slot v3 adapter |
 | `src/session_migrate/formats/opencode.py` | OpenCode 1.17.20 public-bundle writer/parser/validator |
 | `src/session_migrate/formats/copilot.py` | Copilot CLI 1.0.70 event writer/parser/validator |
-| `src/session_migrate/formats/antigravity.py` | Antigravity 1.1.16 clean-room DB adapter |
+| `src/session_migrate/formats/antigravity.py` | Antigravity 1.1.16/1.4.12 clean-room DB adapter |
 | `src/session_migrate/formats/cursor.py` | Experimental pinned Cursor text DB adapter |
 | `src/session_migrate/formats/vibe.py` | Mistral Vibe 2.24.3 two-file adapter |
 | `src/session_migrate/formats/muse.py` | Muse Code 0.2.1 durable event adapter |

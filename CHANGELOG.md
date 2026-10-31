@@ -6,6 +6,15 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Support Antigravity CLI 1.4.12 (macOS arm64) as a second pinned target build
+  next to Linux x86_64 1.1.16. `import` and `transfer` detect which pinned `agy`
+  is installed and write its store layout; `--target-cli-version 1.4.12` selects
+  it for `convert`. The 1.4.12 layout sets conversation `user_version` 1 (at 0
+  the CLI migrates the import into a new trajectory and clears its workspace),
+  records the workspace in trajectory metadata, writes the title to
+  `annotations/<id>.pbtxt`, and uses the 21-column picker index. Validated by
+  resuming installed synthetic sessions with the real CLI; the 1.1.16 layout is
+  unchanged.
 - Read Claude Code compactions that keep recent turns verbatim the way Claude Code
   loads them, instead of failing with `Claude active graph contains an ancestry
   cycle`. Claude stores preserved turns where they were first written and relinks

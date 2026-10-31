@@ -1,20 +1,23 @@
 # Antigravity CLI session format
 
 `session-migrate` supports Antigravity CLI through a clean-room adapter pinned
-to one exact release:
+to exact executables:
 
-| Property | Pinned value |
-| --- | --- |
-| CLI | `agy 1.1.16` for Linux x86_64 |
-| Executable size | `205,545,512` bytes |
-| Executable SHA-256 | `b233e6a4f38564a06a0d3220aa79f6a7c8f11da2b85fc8f0957f8a14d46e6cc9` |
-| ELF build ID | `95255e71338e3256f85c7f71f03ecaa0` |
-| Conversation store | `~/.gemini/antigravity-cli/conversations/<uuid>.db` |
-| Picker index | `~/.gemini/antigravity-cli/conversation_summaries.db` |
+| Property | Linux x86_64 build | macOS arm64 build |
+| --- | --- | --- |
+| CLI | `agy 1.1.16` | `agy 1.4.12` |
+| Executable size | `205,545,512` bytes | `197,589,952` bytes |
+| Executable SHA-256 | `b233e6a4f38564a06a0d3220aa79f6a7c8f11da2b85fc8f0957f8a14d46e6cc9` | `34423fc9b0af3841e7646aa72a2d40ffeab8218b22d1cb99eac7355f9eba31e3` |
+| ELF build ID | `95255e71338e3256f85c7f71f03ecaa0` | — |
+| Conversation store | `~/.gemini/antigravity-cli/conversations/<uuid>.db` | same |
+| Picker index | `~/.gemini/antigravity-cli/conversation_summaries.db` | same, two more columns |
+| Title | picker index | `~/.gemini/antigravity-cli/annotations/<uuid>.pbtxt` |
 
-This is deliberately not a claim of compatibility with later Antigravity
-versions. Automatic installation checks the executable version, byte size, and
-digest before it touches the native store.
+This is deliberately not a claim of compatibility with other Antigravity
+versions or platforms. Automatic installation checks the executable version,
+byte size, and digest before it touches the native store, and writes the store
+layout of the build it found. The sections below describe 1.1.16; 1.4.12
+differences are listed in [their own section](#antigravity-1412-macos-arm64).
 
 The independently observed schema notes and synthetic standard-library fixture
 generator are published in the unofficial
@@ -192,6 +195,45 @@ available. The credential-free structural suite is always runnable:
 ```console
 uv run pytest -q tests/test_antigravity_format.py
 ```
+
+## Antigravity 1.4.12 (macOS arm64)
+
+The 1.4.12 store keeps the 1.1.16 conversation tables, column declarations,
+indexes, step types, and step payload field numbers. A 1.4.12 conversation
+reads with the same parser. The writer differs in four places:
+
+| Item | 1.1.16 layout | 1.4.12 layout |
+| --- | --- | --- |
+| Conversation `PRAGMA user_version` | `0` | `1` |
+| Trajectory metadata | `2` (seconds), `6`, `18` | adds `1` (`{1: workspace URI, 3: ""}`), `2.2` (nanoseconds), and `7` (workspace URI) |
+| Picker index | 19 columns | adds `raw_summary blob` and `group_id`; `user_version` `3`; rows use status `CASCADE_RUN_STATUS_IDLE` and an empty source |
+| Title | picker `title` column | `annotations/<uuid>.pbtxt` text-format message `title:"…"` (non-ASCII bytes octal-escaped) |
+
+`user_version` is the load-bearing change. 1.4.12 treats a version-0 database as
+an older schema: on first resume it migrates it, opens a second trajectory
+(type `0`, source `0`), and clears the main trajectory's metadata, so the picker
+loses its workspace and project. With version `1` the imported trajectory
+continues as native ones do. 1.4.12 also rebuilds each picker row from the
+trajectory metadata and the annotation after every run, which is why the
+workspace and title live there; `raw_summary` is left `NULL` for it to fill.
+
+Validated on 2026-10-31 (UTC) with synthetic markers in isolated `HOME`
+directories. 1.4.12 keeps its OAuth token in the macOS login Keychain, which an
+isolated `HOME` cannot see; symlinking `$HOME/Library/Keychains` to the real
+directory let the CLI authenticate without copying or printing the token. The
+real `~/.gemini/antigravity-cli` was never written.
+
+1. A native conversation created by `agy -p` parsed with the existing reader.
+2. Bisecting a native database (removing trajectory metadata fields `3` and
+   `15`, executor and generation metadata, per-step metadata, and the serialized
+   summary) never changed how it resumed; resetting `user_version` to `0` was
+   the only change reproducing the second trajectory.
+3. `session-migrate transfer --from claude --to antigravity` installed a
+   synthetic transcript with a tool call, a tool result, and a non-ASCII title.
+   `agy --conversation <id> -p ...` quoted both the imported marker and the tool
+   result. The five imported steps stayed byte-identical while 1.4.12 appended
+   three; the database kept one trajectory and its metadata, and the picker
+   kept the title, workspace, and project.
 
 ## Known boundaries
 
