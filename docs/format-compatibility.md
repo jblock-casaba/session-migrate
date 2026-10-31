@@ -217,6 +217,14 @@ Important graph and content behavior:
   metadata nodes, and follows a compaction boundary's `logicalParentUuid` back
   into pre-compaction history. It reverses the ancestry walk and emits graph
   order; physical line order is not semantic order during streamed writes.
+- A compaction that keeps recent turns verbatim (`compactMetadata.preservedMessages`
+  or `preservedSegment`) stores them where they were first written, often before
+  the boundary. As Claude Code does on load, the last boundary's preserved turns
+  are chained after the summary (`anchorUuid`) and the summary's other children
+  follow the last preserved turn; the summarized history continues from the
+  first preserved turn's original parent. A listed turn that is missing disables
+  the relink, as in Claude Code. A `logicalParentUuid` already on the path ends
+  the history instead of failing as a cycle; `parentUuid` cycles still fail.
 - Without a valid recorded leaf, the last eligible conversation record is used.
   If it lacks a usable UUID, all eligible conversation records are retained in
   file order.

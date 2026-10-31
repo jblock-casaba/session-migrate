@@ -46,7 +46,8 @@ validate source identity before and after reading so an actively appending,
 replaced, or truncated file fails with a retryable error.
 
 - Claude reconstructs the active UUID ancestry selected by `last-prompt`,
-  validates compaction back-edges, and excludes inactive branches/meta prompts.
+  relinks compaction-preserved turns after their summary as Claude Code does, and
+  excludes inactive branches/meta prompts.
 - Codex replays canonical `response_item` history for both legacy and paginated
   rollouts, deduplicates UI projections, filters injected user-role context
   against the UI transcript, and rejects `history_base` lineage or an incomplete

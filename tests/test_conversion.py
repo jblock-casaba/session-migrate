@@ -276,6 +276,89 @@ def test_claude_compaction_logical_back_edge_terminates_cycle(tmp_path: Path) ->
     ]
 
 
+def preserved_compaction(tmp_path: Path, layout: str, preserved: list[str] | None = None) -> Path:
+    """Precomputed compaction that keeps recent turns where they were first written."""
+
+    cwd = str(tmp_path)
+    tail_after_summary = layout == "tail_after_summary"
+    uuids = preserved or (["u1", "a1", "tail"] if tail_after_summary else ["u1", "a1"])
+    boundary = {
+        "type": "system",
+        "subtype": "compact_boundary",
+        "uuid": "boundary",
+        "parentUuid": None,
+        "logicalParentUuid": uuids[-1],
+        "sessionId": "11111111-1111-4111-8111-111111111111",
+        "timestamp": "2026-08-17T12:00:00Z",
+        "cwd": cwd,
+        "version": "2.1.304",
+        "compactMetadata": {
+            "trigger": "auto",
+            "precomputed": True,
+            "preservedSegment": {"anchorUuid": "summary", "headUuid": "u1", "tailUuid": uuids[-1]},
+            "preservedMessages": {
+                "anchorUuid": "summary",
+                "uuids": uuids,
+                "allUuids": [*uuids, "never-written"],
+            },
+        },
+    }
+    attachment = {**boundary, "type": "attachment", "uuid": "attachment", "parentUuid": "boundary"}
+    del attachment["subtype"], attachment["logicalParentUuid"], attachment["compactMetadata"]
+    summary = claude_record(
+        "user", "summary", "attachment" if tail_after_summary else "boundary", "summary", cwd=cwd
+    )
+    summary["isCompactSummary"] = True
+    records = [
+        claude_record("user", "u0", None, "old question", cwd=cwd),
+        claude_record("assistant", "a0", "u0", "old answer", cwd=cwd),
+        claude_record("user", "u1", "a0", "recent question", cwd=cwd),
+        claude_record("assistant", "a1", "u1", "recent answer", cwd=cwd),
+        boundary,
+        *([attachment] if tail_after_summary else []),
+        summary,
+    ]
+    if tail_after_summary:
+        records.append({**attachment, "uuid": "tail", "parentUuid": "summary"})
+    records += [
+        claude_record("assistant", "a2", records[-1]["uuid"], "after", cwd=cwd),
+        {"type": "last-prompt", "leafUuid": "a2"},
+    ]
+    return write_jsonl(tmp_path / f"claude-{layout}.jsonl", records)
+
+
+@pytest.mark.parametrize("layout", ["tail_after_summary", "logical_parent_is_tail"])
+def test_claude_preserved_segment_is_relinked_after_its_summary(
+    tmp_path: Path, layout: str
+) -> None:
+    """Claude Code chains preserved turns after the summary when it loads them."""
+
+    session = claude.parse(preserved_compaction(tmp_path, layout))
+    trimmed, stats = conversion.truncate_to_last_compaction(session)
+
+    def texts(events: tuple) -> list[str]:
+        return [event.text for event in events if event.text]
+
+    assert texts(session.events) == [
+        "old question",
+        "old answer",
+        "summary",
+        "recent question",
+        "recent answer",
+        "after",
+    ]
+    assert texts(trimmed.events) == ["summary", "recent question", "recent answer", "after"]
+    assert stats["compaction_summary_carried"] == 1
+
+
+def test_claude_missing_preserved_message_skips_relink_like_claude(tmp_path: Path) -> None:
+    path = preserved_compaction(tmp_path, "tail_after_summary", ["u1", "lost", "tail"])
+
+    session = claude.parse(path)
+
+    assert [event.text for event in session.events if event.text] == ["summary", "after"]
+
+
 def test_claude_to_codex_preserves_messages_and_tools(tmp_path: Path) -> None:
     cwd = str(tmp_path)
     source_path = write_jsonl(

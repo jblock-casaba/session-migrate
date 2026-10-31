@@ -6,6 +6,12 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Read Claude Code compactions that keep recent turns verbatim the way Claude Code
+  loads them, instead of failing with `Claude active graph contains an ancestry
+  cycle`. Claude stores preserved turns where they were first written and relinks
+  them after the summary on load; the reader now applies that relink, so the
+  turns follow the summary in full transfers and are kept by
+  `--since-last-compaction` instead of being cut with the summarized history.
 - Accept repeated Claude record UUIDs when only optional `promptId` and `slug`
   bookkeeping differs. Replay the first copy once and report later copies as
   `opaque:duplicate_record_uuid`; preserve conflict and ancestry validation.

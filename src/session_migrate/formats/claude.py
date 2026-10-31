@@ -490,6 +490,7 @@ def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord
     if not leaf_uuid or leaf_uuid not in by_uuid:
         return candidates
 
+    relinked, relinked_boundary, summarized_parent = _preserved_segment_parents(records, by_uuid)
     leaf_to_root: list[JsonlRecord] = []
     seen: set[str] = set()
     cursor: str | None = leaf_uuid
@@ -501,72 +502,100 @@ def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord
         if record is None:
             raise SessionMigrateError("Claude active graph references a missing parent UUID")
         leaf_to_root.append(record)
-        parent_uuid = string(record.value.get("parentUuid"))
+        parent_uuid = relinked.get(cursor) or string(record.value.get("parentUuid"))
         if parent_uuid:
             cursor = parent_uuid
             continue
-        logical_parent = (
-            string(record.value.get("logicalParentUuid"))
-            if record.value.get("type") == "system"
-            and record.value.get("subtype") == "compact_boundary"
-            else None
+        if (
+            record.value.get("type") != "system"
+            or record.value.get("subtype") != "compact_boundary"
+        ):
+            break
+        # Continue into the history the compaction summarized, so a full transcript keeps
+        # it. Claude Code itself never follows this link; a logical parent already on the
+        # path (a preserved segment written after its summary) has no earlier history.
+        history = (
+            summarized_parent
+            if cursor == relinked_boundary
+            else string(record.value.get("logicalParentUuid"))
         )
-        if logical_parent and logical_parent in seen:
-            if _valid_preserved_compaction_back_edge(record, logical_parent, seen, by_uuid):
-                break
-            raise SessionMigrateError("Claude active graph contains an ancestry cycle")
-        cursor = logical_parent
+        cursor = None if history in seen else history
     return list(reversed(leaf_to_root))
 
 
-def _valid_preserved_compaction_back_edge(
-    boundary: JsonlRecord,
-    logical_parent: str,
-    seen: set[str],
-    by_uuid: dict[str, JsonlRecord],
-) -> bool:
-    """Recognize Claude's metadata-declared preserved-segment loop."""
+def _preserved_segment_parents(
+    records: list[JsonlRecord], by_uuid: dict[str, JsonlRecord]
+) -> tuple[dict[str, str], str | None, str | None]:
+    """Replay how Claude Code relinks a compaction's preserved segment on load.
 
-    metadata = boundary.value.get("compactMetadata")
-    if not isinstance(metadata, dict):
-        return False
-    segment = metadata.get("preservedSegment")
-    messages = metadata.get("preservedMessages")
-    if not isinstance(segment, dict) or not isinstance(messages, dict):
-        return False
-    anchor = string(segment.get("anchorUuid"))
-    head = string(segment.get("headUuid"))
-    tail = string(segment.get("tailUuid"))
-    boundary_uuid = string(boundary.value.get("uuid"))
-    if not all((anchor, head, tail, boundary_uuid)) or logical_parent != tail:
-        return False
-    assert anchor is not None and head is not None and tail is not None
-    assert boundary_uuid is not None
-    anchor_record = by_uuid.get(anchor)
+    A compaction may keep recent messages verbatim. Claude stores them where they were
+    written, before the boundary or after its summary, and on load chains them after the
+    summary (the anchor) before walking ``parentUuid``. Only the last boundary counts,
+    and a listed message that is missing disables the relink, as in Claude itself.
+
+    Returns the parent overrides, the relinked boundary UUID, and the original parent of
+    the first preserved message, where the summarized history continues.
+    """
+
+    boundary: dict[str, Any] | None = None
+    for record in records:
+        if record.value.get("type") == "system" and record.value.get("subtype") == (
+            "compact_boundary"
+        ):
+            boundary = record.value
+    metadata = object_value(boundary.get("compactMetadata")) if boundary else {}
+    listed = metadata.get("preservedMessages")
+    segment = object_value(metadata.get("preservedSegment"))
+    boundary_uuid = string(boundary.get("uuid")) if boundary else None
+    if isinstance(listed, dict):
+        anchor = string(listed.get("anchorUuid"))
+        preserved = listed.get("uuids")
+    else:
+        anchor = string(segment.get("anchorUuid"))
+        preserved = []
+        cursor = string(segment.get("tailUuid"))
+        while cursor in by_uuid and cursor not in preserved:
+            preserved.append(cursor)
+            if cursor == string(segment.get("headUuid")):
+                break
+            cursor = string(by_uuid[cursor].value.get("parentUuid"))
+        preserved.reverse()
+        if not preserved or preserved[0] != string(segment.get("headUuid")):
+            preserved = []
     if (
-        anchor_record is None
-        or anchor_record.value.get("isCompactSummary") is not True
-        or string(anchor_record.value.get("parentUuid")) != boundary_uuid
+        not boundary_uuid
+        or anchor not in by_uuid
+        or not isinstance(preserved, list)
+        or not preserved
+        or any(not isinstance(item, str) or item not in by_uuid for item in preserved)
+        or len(set(preserved)) != len(preserved)
+        or anchor in preserved
+        or boundary_uuid in preserved
     ):
-        return False
-    declared = messages.get("allUuids", messages.get("uuids"))
-    if not isinstance(declared, list) or not declared:
-        return False
-    declared_ids = {value for value in declared if isinstance(value, str)}
-    if not {head, tail}.issubset(declared_ids) or not declared_ids.issubset(seen):
-        return False
+        return {}, None, None
 
-    cursor: str | None = tail
-    preserved_path: set[str] = set()
-    while cursor and cursor != anchor:
-        if cursor in preserved_path or cursor not in seen:
-            return False
-        preserved_path.add(cursor)
-        record = by_uuid.get(cursor)
-        if record is None:
-            return False
-        cursor = string(record.value.get("parentUuid"))
-    return cursor == anchor and head in preserved_path
+    parents: dict[str, str] = {}
+    previous = anchor
+    for item in preserved:
+        parents[item] = previous
+        previous = item
+    last = preserved[-1]
+    kept = set(preserved)
+    positions = {item: position for position, item in enumerate(by_uuid)}
+    discarded = {
+        item
+        for item, position in positions.items()
+        if position < positions[boundary_uuid] and item not in kept
+    }
+    for item, record in by_uuid.items():
+        if item in kept or item in discarded:
+            continue
+        parent = string(record.value.get("parentUuid"))
+        if parent == anchor or (
+            parent in discarded and record.value.get("type") in {"user", "assistant"}
+        ):
+            parents[item] = last
+    return parents, boundary_uuid, string(by_uuid[preserved[0]].value.get("parentUuid"))
 
 
 def _contextual_user_marker(value: dict[str, Any], content: Any) -> str | None:
