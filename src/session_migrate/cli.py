@@ -63,10 +63,102 @@ _SHARED_DATABASE_TARGETS = {
 }
 
 
+_EXAMPLES = """\
+examples:
+  Any source to any target, by native session ID. This is the usual path --
+  it finds the session in the source agent's home and installs it into the
+  target agent's home, so you never name an output path:
+
+    session-migrate transfer --from codex       --to claude  <session-id>
+    session-migrate transfer --from copilot     --to claude  <session-id>
+    session-migrate transfer --from cursor      --to claude  <session-id>
+    session-migrate transfer --from antigravity --to claude  <session-id>
+    session-migrate transfer --from opencode    --to claude  <session-id>
+    session-migrate transfer --from kilo        --to claude  <session-id>
+    session-migrate transfer --from pi          --to claude  <session-id>
+    session-migrate transfer --from omp         --to claude  <session-id>
+    session-migrate transfer --from vibe        --to claude  <session-id>
+    session-migrate transfer --from muse        --to claude  <session-id>
+    session-migrate transfer --from qwen        --to claude  <session-id>
+    session-migrate transfer --from kimi        --to claude  <session-id>
+    session-migrate transfer --from grok        --to claude  <session-id>
+    session-migrate transfer --from openhands   --to claude  <session-id>
+    session-migrate transfer --from hermes      --to claude  <session-id>
+    session-migrate transfer --from mastracode  --to claude  <session-id>
+    session-migrate transfer --from devin       --to claude  <session-id>
+
+  Every pair works, not just "to claude" -- reverse or mix freely:
+
+    session-migrate transfer --from claude --to codex    <session-id>
+    session-migrate transfer --from claude --to copilot  <session-id>
+    session-migrate transfer --from codex  --to opencode <session-id>
+
+  From a transcript path instead of an ID (same install behavior):
+
+    session-migrate import --to claude ~/.codex/sessions/2026/10/19/rollout-*-<id>.jsonl
+    session-migrate import --to claude --format copilot ~/.copilot/session-state/<id>/events.jsonl
+
+  To a file you name, installing nothing:
+
+    session-migrate convert --to claude --output ./out.jsonl <id-or-path>
+
+  Look before you leap:
+
+    session-migrate inspect <id-or-path>              # content-free structure summary
+    session-migrate transfer --from codex --to claude --dry-run <session-id>
+    session-migrate import --to claude --dry-run <path>
+
+  Find a session ID:
+
+    session-migrate catalog refresh
+    session-migrate catalog list
+    session-migrate catalog search <keyword>
+    session-migrate transfer --title "<exact session title>" --to claude
+
+  Long sessions. A full transcript routinely exceeds the target model's
+  context window; this keeps only the window the source agent would itself
+  resume with (post-compaction history plus everything after it):
+
+    session-migrate transfer --from codex --to claude --since-last-compaction <session-id>
+
+native session locations
+  Used to resolve --from (source) and --to (target). Override with --source-home
+  / --home, or the listed environment variable.
+
+  claude       ~/.claude/projects/<cwd-slug>/<uuid>.jsonl          $CLAUDE_CONFIG_DIR
+  codex        ~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl $CODEX_HOME
+  copilot      ~/.copilot/session-state/<uuid>/events.jsonl        $COPILOT_HOME
+  pi           ~/.pi/agent                                         $PI_CODING_AGENT_DIR
+  omp          ~/.omp/agent                                        $PI_CODING_AGENT_DIR
+  antigravity  ~/.gemini/antigravity-cli/conversations/<uuid>.db
+  cursor       ~/.cursor                                           (pinned, text-only, experimental)
+  vibe         ~/.vibe
+  muse         ~/.local/share/muse/sessions/*/*/*/<uuid>/session.jsonl   $XDG_DATA_HOME
+  qwen         ~/.qwen                                             $QWEN_HOME
+  kimi         ~/.kimi-code                                        $KIMI_CODE_HOME
+  grok         ~/.grok
+  openhands    ~/.openhands/conversations/<uuid-no-dashes>/events
+  hermes       ~/.hermes                                           (central database)
+  mastracode   platform app-support dir                            (central database)
+  devin        platform app-support dir
+  opencode     no fixed home -- exported through its own CLI; see --source-cli / --target-cli
+  kilo         no fixed home -- exported through its own CLI; see --source-cli / --target-cli
+
+notes
+  - IDs are the source agent's own session IDs. OpenCode uses ses_* rather than a UUID.
+  - --cwd sets the working directory recorded in the target, which is what decides
+    the project folder for Claude. It defaults to the cwd the source recorded.
+  - Conversion is lossy across agents. Reasoning/thinking blocks and agent-specific
+    events are dropped; --dry-run lists exactly what would be omitted.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="session-migrate",
         description="Migrate native sessions among supported coding agent CLIs.",
+        epilog=_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
