@@ -1996,3 +1996,60 @@ def test_claude_human_origin_wins_for_notices_but_not_command_envelopes(
     session = claude.parse(write_jsonl(tmp_path / "claude.jsonl", [record]))
 
     assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [pasted]
+
+
+@pytest.mark.parametrize(
+    ("is_error", "expected"),
+    [(True, claude.EMPTY_ERROR_RESULT), (False, "")],
+)
+def test_claude_writer_never_emits_an_empty_error_tool_result(
+    tmp_path: Path, is_error: bool, expected: str
+) -> None:
+    """The Messages API rejects an error tool_result whose content is empty."""
+
+    from session_migrate.model import Event, Provenance
+
+    events = (
+        Event(kind=EventKind.MESSAGE, role=Role.USER, text="run it", provenance=Provenance(0, "u")),
+        Event(
+            kind=EventKind.TOOL_CALL,
+            role=Role.ASSISTANT,
+            tool_name="run_command",
+            tool_call_id="call-1",
+            payload={"input": {}},
+            provenance=Provenance(1, "a"),
+        ),
+        Event(
+            kind=EventKind.TOOL_RESULT,
+            role=Role.TOOL,
+            text=None,
+            tool_call_id="call-1",
+            payload={"is_error": is_error, "content_blocks": [{"type": "text", "text": ""}]},
+            provenance=Provenance(2, "t"),
+        ),
+    )
+    session = Session(
+        source_format=AgentFormat.ANTIGRAVITY,
+        source_path=tmp_path / "source.db",
+        source_sha256="0" * 64,
+        session_id=None,
+        cwd=tmp_path,
+        started_at="2026-11-01T00:00:00Z",
+        cli_version=None,
+        model=None,
+        title=None,
+        events=events,
+        raw_record_count=len(events),
+    )
+    artifact = convert_session(
+        session, ConversionOptions(target_format=AgentFormat.CLAUDE, cwd=tmp_path)
+    )
+    results = [
+        block
+        for line in artifact.native_bytes.splitlines()
+        for block in (json.loads(line).get("message", {}).get("content") or [])
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+    assert [(block["content"], block["is_error"]) for block in results] == [(expected, is_error)]
+    assert artifact.dropped.get("tool_result:empty_error_output", 0) == int(is_error)

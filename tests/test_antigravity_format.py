@@ -654,7 +654,7 @@ def test_cancelled_native_tool_step_without_result_still_answers_its_call(
 
     session = antigravity.parse_session(path)
 
-    assert tool_results(session.events) == [("agy-call-1", None, True)]
+    assert tool_results(session.events) == [("agy-call-1", antigravity.CANCELED_TOOL_RESULT, True)]
     assert [
         event.payload["reason"]
         for event in session.events
@@ -689,3 +689,60 @@ def test_empty_conversation_is_reported_as_empty(tmp_path: Path) -> None:
 
     with pytest.raises(SessionMigrateError, match="conversation is empty"):
         antigravity.parse_session(path)
+
+
+def test_checkpoint_summary_is_a_compaction_boundary_carried_into_claude(
+    tmp_path: Path,
+) -> None:
+    from session_migrate.conversion import (
+        ConversionOptions,
+        convert_session,
+        truncate_to_last_compaction,
+    )
+    from session_migrate.model import TargetFormat
+
+    path = tmp_path / f"{TARGET_ID}.db"
+    path.write_bytes(serialized(tmp_path))
+    with sqlite3.connect(path) as db:
+        count = db.execute("SELECT count(*) FROM steps").fetchone()[0]
+        checkpoint = antigravity._field_text(5, "<summary>AGY_CHECKPOINT_SUMMARY</summary>")
+        checkpoint += antigravity._field_varint(12, count)
+        user = antigravity._field_text(2, "AGY_AFTER_CHECKPOINT")
+        for index, step_type, oneof in (
+            (count, antigravity.STEP_TYPE_CHECKPOINT, checkpoint),
+            (count + 1, antigravity.STEP_TYPE_USER_INPUT, user),
+        ):
+            payload = (
+                antigravity._field_varint(1, step_type)
+                + antigravity._field_varint(4, antigravity.STEP_STATUS_DONE)
+                + antigravity._field_bytes(antigravity._STEP_PAYLOAD_FIELDS[step_type], oneof)
+            )
+            db.execute(
+                "INSERT INTO steps(idx,step_type,status,step_payload) VALUES(?,?,?,?)",
+                (index, step_type, antigravity.STEP_STATUS_DONE, payload),
+            )
+
+    trimmed, stats = truncate_to_last_compaction(antigravity.parse_session(path))
+    artifact = convert_session(
+        trimmed, ConversionOptions(target_format=TargetFormat.CLAUDE, cwd=tmp_path)
+    )
+    messages = [
+        json.loads(line)["message"]
+        for line in artifact.native_bytes.splitlines()
+        if "message" in json.loads(line)
+    ]
+
+    assert stats["compaction_summary_carried"] == 1
+    assert [event.text for event in trimmed.events if event.text] == [
+        "<summary>AGY_CHECKPOINT_SUMMARY</summary>",
+        "AGY_AFTER_CHECKPOINT",
+    ]
+    assert messages == [
+        {
+            "role": "user",
+            "content": "Summary of the earlier part of this conversation:\n\n"
+            "<summary>AGY_CHECKPOINT_SUMMARY</summary>",
+        },
+        {"role": "user", "content": "AGY_AFTER_CHECKPOINT"},
+    ]
+    assert artifact.dropped["compaction:summary_as_user_message"] == 1

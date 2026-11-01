@@ -6,10 +6,19 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Never write a Claude error tool result with empty content, which the Messages
+  API rejects (`content cannot be empty if is_error is true`) and which blocked
+  resuming and compacting the session. Such results get a short placeholder,
+  counted as `tool_result:empty_error_output`; empty text blocks are dropped.
+- Treat Antigravity checkpoints, which hold a plaintext conversation summary, as
+  compaction boundaries for `--since-last-compaction`.
+- Replay the summary a truncated transcript starts from as the first user message
+  of a Claude target, counted as `compaction:summary_as_user_message`, so the
+  resumed model keeps the earlier context. Previously Claude targets dropped it.
 - Read Antigravity tool steps that were cancelled or failed without a result
   instead of failing with `Antigravity generic tool result is missing`. Each is
-  projected as an error result carrying its result text or the step's error
-  message; a step with no result is counted as
+  projected as an error result carrying its result text, the step's error
+  message, or a cancellation notice; a step with no result is counted as
   `opaque:antigravity_tool_step_without_result`. An empty conversation is now
   reported as empty rather than as a step-count safety violation.
 - Support Antigravity CLI 1.4.12 (macOS arm64) as a second pinned target build

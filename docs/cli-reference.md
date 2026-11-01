@@ -190,7 +190,15 @@ a truncated Claude migration keeps the summary that frames the remaining turns.
 In every observed Codex rollout the `compacted.message` field is empty and the
 replacement history ends in a provider-encrypted `compaction` item, so there the
 summary survives only as a counted opaque placeholder and the carried anchor
-messages, not the summary, give the resumed session its framing.
+messages, not the summary, give the resumed session its framing. Antigravity
+checkpoints and Copilot compactions and context clears record plaintext
+summaries and serve as boundaries too.
+
+A Claude target has no portable compaction record, so a transcript that starts
+from a summary replays it as the first user message under the heading
+"Summary of the earlier part of this conversation:", counted as
+`compaction:summary_as_user_message`. Summaries later in a full transcript are
+still omitted because the turns they summarize are present.
 
 The option fails closed when a session has no compaction boundary, because the
 full transcript is already its effective window.

@@ -223,7 +223,15 @@ cancelled before it returned) or a result holding only UI summary fields. The
 reader projects each as an error result so the call stays answered: the result
 text when present, otherwise the step's error message (field `31`, mirrored in
 `error_details`), otherwise empty. A step with no result is also counted as
-`antigravity_tool_step_without_result`. An empty conversation fails as empty.
+`antigravity_tool_step_without_result`; a cancelled step with no result or error
+message says it was cancelled, since an empty error result is invalid for Claude.
+An empty conversation fails as empty.
+
+A checkpoint step (type `23`, payload field `30`) holds a plaintext `<summary>` in
+field `5`, its own step index in field `12`, and the previous checkpoint's index in
+field `11`. Later model calls send the summary and the steps after it, so the
+reader projects each checkpoint with a summary as a compaction boundary, which
+`--since-last-compaction` cuts at.
 
 Validated on 2026-10-31 (UTC) with synthetic markers in isolated `HOME`
 directories. 1.4.12 keeps its OAuth token in the macOS login Keychain, which an

@@ -24,6 +24,9 @@ from session_migrate.jsonl import JsonlRecord, encode_jsonl, file_sha256, iter_j
 from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Role, Session
 
 PINNED_CLAUDE_VERSION = "2.1.209"
+# The Messages API rejects an error tool result without content.
+EMPTY_ERROR_RESULT = "The tool reported an error without output."
+COMPACTION_SUMMARY_HEADING = "Summary of the earlier part of this conversation:"
 TITLE_TYPES = {"custom-title": "customTitle", "ai-title": "aiTitle"}
 _REPEATED_RECORD_METADATA = frozenset({"promptId", "slug"})
 
@@ -355,12 +358,27 @@ def serialize(
                 seen_tool_result_ids.add(source_tool_call_id)
             result_content, omitted_blocks = _claude_tool_result_content(event)
             dropped.update(omitted_blocks)
+            is_error = bool(event.payload.get("is_error", False))
+            if is_error and not result_content:
+                result_content = EMPTY_ERROR_RESULT
+                dropped["tool_result:empty_error_output"] += 1
             block = {
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,
                 "content": result_content,
-                "is_error": bool(event.payload.get("is_error", False)),
+                "is_error": is_error,
             }
+        elif (
+            event.kind == EventKind.COMPACTION
+            and event.text
+            and not emitted
+            and pending_role is None
+        ):
+            # A transcript cut at a compaction starts from its summary; replay it so the
+            # resumed model keeps the earlier context. Later summaries are redundant.
+            target_role = Role.USER
+            block = {"type": "text", "text": f"{COMPACTION_SUMMARY_HEADING}\n\n{event.text}"}
+            dropped["compaction:summary_as_user_message"] += 1
         elif (
             event.kind == EventKind.CONTEXT
             and event.payload.get("block_type") == "image"
@@ -760,7 +778,9 @@ def _claude_tool_result_content(event: Event) -> tuple[str | list[dict[str, Any]
             continue
         block_type = portable.get("type")
         if block_type == "text" and isinstance(portable.get("text"), str):
-            result.append({"type": "text", "text": portable["text"]})
+            # The Messages API rejects empty text blocks.
+            if portable["text"]:
+                result.append({"type": "text", "text": portable["text"]})
         elif block_type == "image":
             source = claude_source_from_image_url(portable.get("image_url"))
             if source:

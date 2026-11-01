@@ -82,6 +82,7 @@ PROJECT_ID = "default-cli-project"
 
 STEP_STATUS_DONE = 3
 STEP_STATUS_CANCELED = 6
+CANCELED_TOOL_RESULT = "The tool call was cancelled before it returned a result."
 STEP_STATUS_ERROR = 7
 STEP_TYPE_USER_INPUT = 14
 STEP_TYPE_PLANNER_RESPONSE = 15
@@ -89,6 +90,7 @@ STEP_TYPE_VIEW_FILE = 8
 STEP_TYPE_LIST_DIRECTORY = 9
 STEP_TYPE_RUN_COMMAND = 21
 STEP_TYPE_MCP_TOOL = 38
+STEP_TYPE_CHECKPOINT = 23
 STEP_TYPE_FILE_CHANGE = 86
 STEP_TYPE_CONVERSATION_HISTORY = 98
 STEP_TYPE_SHELL_EXEC = 112
@@ -102,7 +104,7 @@ _STEP_PAYLOAD_FIELDS = {
     STEP_TYPE_USER_INPUT: 19,
     STEP_TYPE_PLANNER_RESPONSE: 20,
     STEP_TYPE_RUN_COMMAND: 28,
-    23: 30,  # checkpoint
+    STEP_TYPE_CHECKPOINT: 30,
     STEP_TYPE_MCP_TOOL: 47,
     STEP_TYPE_FILE_CHANGE: 98,
     STEP_TYPE_CONVERSATION_HISTORY: 111,
@@ -1194,6 +1196,8 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
             result_text = _optional_text(result_fields, 1)
             if not result_text and failed:
                 result_text = _step_error_text(outer)
+            if not result_text and row.status == STEP_STATUS_CANCELED:
+                result_text = CANCELED_TOOL_RESULT
             if result is None:
                 # Keep the call answered so targets that require a result stay valid.
                 events.append(_opaque_event(row, "antigravity_tool_step_without_result", timestamp))
@@ -1269,6 +1273,25 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
                 )
             else:
                 events.append(_opaque_event(row, "antigravity_mcp_without_text", timestamp))
+            continue
+        if row.step_type == STEP_TYPE_CHECKPOINT and payload is not None:
+            # A checkpoint summarizes the conversation so far; later model calls send
+            # the summary and the steps after it, as a compaction does.
+            summary = _optional_text(_decode_message(payload), 5)
+            if summary:
+                events.append(
+                    Event(
+                        kind=EventKind.COMPACTION,
+                        role=Role.SYSTEM,
+                        text=summary,
+                        timestamp=timestamp,
+                        provenance=provenance,
+                    )
+                )
+            else:
+                events.append(
+                    _opaque_event(row, "antigravity_checkpoint_without_summary", timestamp)
+                )
             continue
         projected = _project_observed_tool(row, payload, pending, timestamp)
         if projected is not None:
