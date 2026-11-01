@@ -604,3 +604,88 @@ def test_binary_gate_names_every_pinned_build_and_reports_none_installed(
     with pytest.raises(SessionMigrateError, match=r"exact macOS arm64 1\.4\.12 build$"):
         antigravity.verify_pinned_cli(executable, version="1.4.12")
     assert antigravity.installed_pinned_version(executable) is None
+
+
+def native_generic_step(
+    tmp_path: Path, status: int, result: bytes | None, error: bytes | None
+) -> Path:
+    """Rewrite the fixture's generic tool step the way 1.4.12 stores a cancelled or failed one."""
+
+    path = tmp_path / f"{TARGET_ID}.db"
+    path.write_bytes(serialized(tmp_path))
+    with sqlite3.connect(path) as db:
+        index, payload = db.execute(
+            "SELECT idx, step_payload FROM steps WHERE step_type=?",
+            (antigravity.STEP_TYPE_GENERIC,),
+        ).fetchone()
+        generic = next(
+            field.value for field in antigravity._decode_message(payload) if field.number == 140
+        )
+        arguments = b"".join(
+            antigravity._field_bytes(1, field.value)
+            for field in antigravity._decode_message(generic)
+            if field.number == 1
+        )
+        inner = arguments + (antigravity._field_bytes(2, result) if result is not None else b"")
+        rebuilt = (
+            antigravity._field_varint(1, antigravity.STEP_TYPE_GENERIC)
+            + antigravity._field_varint(4, status)
+            + antigravity._field_bytes(140, inner)
+            + (antigravity._field_bytes(31, error) if error is not None else b"")
+        )
+        db.execute(
+            "UPDATE steps SET status=?, step_payload=? WHERE idx=?", (status, rebuilt, index)
+        )
+    return path
+
+
+def tool_results(events: tuple[Event, ...]) -> list[tuple[object, ...]]:
+    return [
+        (event.tool_call_id, event.text, event.payload["is_error"])
+        for event in events
+        if event.kind == EventKind.TOOL_RESULT
+    ]
+
+
+def test_cancelled_native_tool_step_without_result_still_answers_its_call(
+    tmp_path: Path,
+) -> None:
+    path = native_generic_step(tmp_path, antigravity.STEP_STATUS_CANCELED, None, None)
+
+    session = antigravity.parse_session(path)
+
+    assert tool_results(session.events) == [("agy-call-1", None, True)]
+    assert [
+        event.payload["reason"]
+        for event in session.events
+        if event.payload.get("reason") == "antigravity_tool_step_without_result"
+    ] == ["antigravity_tool_step_without_result"]
+
+
+def test_failed_native_tool_step_uses_its_error_message(tmp_path: Path) -> None:
+    ui_only_result = antigravity._field_bytes(3, antigravity._field_text(5, "Analyzing"))
+    error = antigravity._field_text(2, "file does not exist") + antigravity._field_text(
+        3, "file does not exist"
+    )
+    path = native_generic_step(tmp_path, antigravity.STEP_STATUS_ERROR, ui_only_result, error)
+
+    session = antigravity.parse_session(path)
+
+    assert tool_results(session.events) == [("agy-call-1", "file does not exist", True)]
+
+
+def test_generated_database_still_requires_generic_tool_results(tmp_path: Path) -> None:
+    path = native_generic_step(tmp_path, antigravity.STEP_STATUS_DONE, None, None)
+
+    with pytest.raises(SessionMigrateError, match="generic tool result is missing"):
+        antigravity.validate_native_bytes(path.read_bytes(), TARGET_ID)
+
+
+def test_empty_conversation_is_reported_as_empty(tmp_path: Path) -> None:
+    path = tmp_path / f"{TARGET_ID}.db"
+    path.write_bytes(serialized(tmp_path))
+    with sqlite3.connect(path) as db:
+        db.execute("DELETE FROM steps")
+
+    with pytest.raises(SessionMigrateError, match="conversation is empty"):
+        antigravity.parse_session(path)

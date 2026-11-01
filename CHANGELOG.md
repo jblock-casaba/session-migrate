@@ -6,6 +6,12 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Read Antigravity tool steps that were cancelled or failed without a result
+  instead of failing with `Antigravity generic tool result is missing`. Each is
+  projected as an error result carrying its result text or the step's error
+  message; a step with no result is counted as
+  `opaque:antigravity_tool_step_without_result`. An empty conversation is now
+  reported as empty rather than as a step-count safety violation.
 - Support Antigravity CLI 1.4.12 (macOS arm64) as a second pinned target build
   next to Linux x86_64 1.1.16. `import` and `transfer` detect which pinned `agy`
   is installed and write its store layout; `--target-cli-version 1.4.12` selects

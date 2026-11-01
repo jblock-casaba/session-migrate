@@ -81,6 +81,7 @@ MAX_TEXT_BYTES = 64 * 1024 * 1024
 PROJECT_ID = "default-cli-project"
 
 STEP_STATUS_DONE = 3
+STEP_STATUS_CANCELED = 6
 STEP_STATUS_ERROR = 7
 STEP_TYPE_USER_INPUT = 14
 STEP_TYPE_PLANNER_RESPONSE = 15
@@ -929,7 +930,9 @@ def _validate_database(
         )
 
         count = int(db.execute("SELECT count(*) FROM steps").fetchone()[0])
-        if count <= 0 or count > MAX_STEPS:
+        if count == 0:
+            raise SessionMigrateError("Antigravity conversation is empty; it has no steps")
+        if count > MAX_STEPS:
             raise SessionMigrateError("Antigravity step count violates the safety limit")
         sql_rows = db.execute(
             "SELECT idx,step_type,status,metadata,step_payload,has_subtrajectory,step_format "
@@ -1086,9 +1089,17 @@ def _validate_known_step_payload(step_type: int, data: bytes, *, generated: bool
             entry_fields = _decode_message(entry)
             _required_text(entry_fields, 1, "generic argument key")
             _required_text(entry_fields, 2, "generic argument value")
-        result = _required_bytes(fields, 2, "generic tool result")
-        result_fields = _decode_message(result)
-        _required_text(result_fields, 1, "generic result text", allow_empty=True)
+        # A cancelled or failed native step may lack a result or its text.
+        result = (
+            _required_bytes(fields, 2, "generic tool result")
+            if generated
+            else _optional_bytes(fields, 2)
+        )
+        result_fields = _decode_message(result) if result is not None else ()
+        if generated:
+            _required_text(result_fields, 1, "generic result text", allow_empty=True)
+        else:
+            _optional_text(result_fields, 1)
         for entry in _bytes_values(result_fields, 2):
             metadata_fields = _decode_message(entry)
             _required_text(metadata_fields, 1, "generic result metadata key")
@@ -1177,8 +1188,15 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
             continue
         if row.step_type == STEP_TYPE_GENERIC and payload is not None:
             fields = _decode_message(payload)
-            result_fields = _decode_message(_required_bytes(fields, 2, "generic result"))
-            result_text = _required_text(result_fields, 1, "generic result text", allow_empty=True)
+            result = _optional_bytes(fields, 2)
+            result_fields = _decode_message(result) if result is not None else ()
+            failed = row.status in {STEP_STATUS_ERROR, STEP_STATUS_CANCELED}
+            result_text = _optional_text(result_fields, 1)
+            if not result_text and failed:
+                result_text = _step_error_text(outer)
+            if result is None:
+                # Keep the call answered so targets that require a result stay valid.
+                events.append(_opaque_event(row, "antigravity_tool_step_without_result", timestamp))
             linked_call_id = _generic_result_call_id(result_fields)
             pending_index = next(
                 (
@@ -1202,7 +1220,7 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
                     tool_call_id=call_id,
                     timestamp=timestamp,
                     payload={
-                        "is_error": row.status == STEP_STATUS_ERROR,
+                        "is_error": failed,
                         "content_blocks": (
                             [{"type": "text", "text": result_text}] if result_text else []
                         ),
@@ -1325,6 +1343,19 @@ def _decode_tool_call(data: bytes) -> tuple[str, str, Any]:
     except (json.JSONDecodeError, ValueError, SessionMigrateError) as exc:
         raise SessionMigrateError("Antigravity tool arguments are not bounded JSON") from exc
     return call_id, name, arguments
+
+
+def _step_error_text(fields: Sequence[_WireField]) -> str | None:
+    """Return a failed step's error message (field 31, mirrored in error_details)."""
+
+    details = _optional_bytes(fields, 31)
+    if details is None:
+        return None
+    try:
+        detail_fields = _decode_message(details)
+        return _optional_text(detail_fields, 2) or _optional_text(detail_fields, 3)
+    except SessionMigrateError:
+        return None
 
 
 def _generic_result_call_id(fields: Sequence[_WireField]) -> str | None:

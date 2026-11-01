@@ -217,6 +217,14 @@ continues as native ones do. 1.4.12 also rebuilds each picker row from the
 trajectory metadata and the annotation after every run, which is why the
 workspace and title live there; `raw_summary` is left `NULL` for it to fill.
 
+1.4.12 also stores cancelled tool steps (status `6`) and failed ones (status `7`)
+less uniformly. A generic tool step may have no result at all (a command
+cancelled before it returned) or a result holding only UI summary fields. The
+reader projects each as an error result so the call stays answered: the result
+text when present, otherwise the step's error message (field `31`, mirrored in
+`error_details`), otherwise empty. A step with no result is also counted as
+`antigravity_tool_step_without_result`. An empty conversation fails as empty.
+
 Validated on 2026-10-31 (UTC) with synthetic markers in isolated `HOME`
 directories. 1.4.12 keeps its OAuth token in the macOS login Keychain, which an
 isolated `HOME` cannot see; symlinking `$HOME/Library/Keychains` to the real
