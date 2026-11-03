@@ -3,23 +3,27 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from collections import Counter, deque
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from session_migrate.errors import SessionMigrateError
 from session_migrate.formats.common import content_text, object_value, string, valid_rfc3339
-from session_migrate.jsonl import encode_jsonl, file_sha256, iter_jsonl
+from session_migrate.jsonl import JsonlRecord, encode_jsonl, file_sha256, iter_jsonl
 from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Role, Session
 
 PINNED_CODEX_VERSION = "0.144.4"
 
 SUPPORTED_HISTORY_MODES = frozenset({"legacy", "paginated"})
+MAX_HISTORY_SEGMENTS = 64
+MAX_CUT_LINE_BYTES = 64 * 1024 * 1024
 
 _MESSAGE_TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text"})
 
@@ -48,7 +52,7 @@ _IMAGE_ATTACHMENT_PREFIX = re.compile(r"\A(?:\s*<image\b[^>]*>\s*(?:</image>\s*)
 
 
 def parse(path: Path) -> Session:
-    records = list(iter_jsonl(path))
+    records = thread_records(path)
     history_mode = _canonical_history_mode(records)
     if history_mode == "paginated":
         _validate_paginated_ordinals(records)
@@ -734,10 +738,119 @@ def _canonical_history_mode(records: Sequence[Any]) -> str | None:
             raise SessionMigrateError(
                 f"Codex history mode {history_mode!r} is not supported; expected {supported}"
             )
-        if payload.get("history_base") is not None:
-            raise SessionMigrateError("Codex history_base lineage is not supported")
         return history_mode
     return None
+
+
+def rollout_segment_order(path: Path) -> str:
+    """Sort key placing a thread's later rollout segments after earlier ones."""
+
+    return path.name.removeprefix("rollout-")[:19]
+
+
+def thread_records(path: Path) -> list[JsonlRecord]:
+    """Return a rollout's records preceded by the earlier history it continues.
+
+    Codex 0.166 continues a thread in a new rollout file whose ``session_meta`` names
+    a ``history_base``: the thread, an exclusive end ordinal, and the byte offset of
+    that cut in the base file. Turns after the cut in the base (an aborted turn the
+    continuation replaced) are not part of the thread.
+    """
+
+    return _thread_records(path, frozenset())
+
+
+def _thread_records(path: Path, seen: frozenset[Path]) -> list[JsonlRecord]:
+    resolved = path.resolve()
+    if resolved in seen or len(seen) >= MAX_HISTORY_SEGMENTS:
+        raise SessionMigrateError("Codex history_base chain is cyclic or too long")
+    records = list(iter_jsonl(path))
+    base = _history_base(records)
+    if base is None:
+        return records
+    thread_id, end_ordinal, end_offset = base
+    base_path = _find_history_base(path, thread_id, end_ordinal, end_offset)
+    prefix = [
+        record
+        for record in _thread_records(base_path, seen | {resolved})
+        if record.value.get("ordinal", end_ordinal) < end_ordinal
+    ]
+    if not prefix or prefix[-1].value.get("ordinal") != end_ordinal - 1:
+        raise SessionMigrateError("Codex history_base does not end at its declared ordinal")
+    if records[0].value.get("ordinal") != end_ordinal:
+        raise SessionMigrateError("Codex continuation does not start at its history_base")
+    return [*prefix, *(replace(record, index=len(prefix) + record.index) for record in records)]
+
+
+def _history_base(records: Sequence[JsonlRecord]) -> tuple[str, int, int] | None:
+    first = records[0].value if records else {}
+    payload = object_value(first.get("payload"))
+    if string(first.get("type")) != "session_meta" or payload.get("history_base") is None:
+        return None
+    base = object_value(payload.get("history_base"))
+    thread_id = string(base.get("thread_id"))
+    end_ordinal = base.get("end_ordinal_exclusive")
+    end_offset = base.get("end_byte_offset")
+    if (
+        not thread_id
+        or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", thread_id)
+        or isinstance(end_ordinal, bool)
+        or not isinstance(end_ordinal, int)
+        or end_ordinal <= 0
+        or isinstance(end_offset, bool)
+        or not isinstance(end_offset, int)
+        or end_offset <= 0
+    ):
+        raise SessionMigrateError("Codex history_base is malformed")
+    if string(payload.get("history_mode")) != "paginated":
+        raise SessionMigrateError("Codex history_base requires a paginated rollout")
+    return thread_id, end_ordinal, end_offset
+
+
+def _find_history_base(path: Path, thread_id: str, end_ordinal: int, end_offset: int) -> Path:
+    """Locate the rollout segment whose bytes are cut exactly where the base ends."""
+
+    directories = [path.parent]
+    if path.parent.name == "archived_sessions":
+        directories.append(path.parent.parent / "sessions")
+    elif len(path.parents) > 4 and path.parents[3].name == "sessions":
+        directories += [path.parents[3], path.parents[4] / "archived_sessions"]
+    candidates: set[Path] = set()
+    for directory in directories:
+        for pattern in (f"rollout-*-{thread_id}.jsonl", f"rollout-*-{thread_id}_*.jsonl"):
+            glob = (
+                directory.glob(f"*/*/*/{pattern}")
+                if directory.name == "sessions"
+                else (directory.glob(pattern))
+            )
+            candidates.update(candidate for candidate in glob if candidate.is_file())
+    candidates.discard(path)
+    for candidate in sorted(candidates, key=rollout_segment_order):
+        if _cut_at(candidate, end_ordinal, end_offset):
+            return candidate
+    raise SessionMigrateError(
+        f"Codex history_base thread {thread_id} was not found up to ordinal {end_ordinal}; "
+        "keep the earlier rollout file next to this one or in the Codex home"
+    )
+
+
+def _cut_at(path: Path, end_ordinal: int, end_offset: int) -> bool:
+    try:
+        with path.open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size < end_offset:
+                return False
+            stream.seek(end_offset - 1)
+            if stream.read(1) != b"\n":
+                return False
+            line = stream.readline(MAX_CUT_LINE_BYTES)
+    except OSError:
+        return False
+    if not line.strip():
+        return True
+    with suppress(ValueError):
+        value = json.loads(line)
+        return isinstance(value, dict) and value.get("ordinal") == end_ordinal
+    return False
 
 
 def _validate_paginated_ordinals(records: Sequence[Any]) -> None:

@@ -6,6 +6,14 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Migrate Codex threads that continue across rollout segments. Codex 0.166 writes
+  a continuation as `rollout-<time>-<id>_<suffix>.jsonl` whose `history_base`
+  points into the earlier segment instead of repeating it. Transfer by session ID
+  matched only the earlier file, so the migrated session silently ended where
+  that file stopped. Discovery now picks the latest segment, and the reader
+  rebuilds the thread from the base up to its declared ordinal and byte offset,
+  dropping the turn the continuation replaced; a missing or mismatched base
+  fails closed. Catalog no longer marks continuations unsupported.
 - Never write a Claude error tool result with empty content, which the Messages
   API rejects (`content cannot be empty if is_error is true`) and which blocked
   resuming and compacting the session. Such results get a short placeholder,

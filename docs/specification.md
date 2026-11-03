@@ -30,8 +30,9 @@ creates a new independent target session; it does not move/delete the source,
 clone runtime state byte-for-byte, synchronize future turns, or re-execute
 historical tools.
 
-Codex `history_base` fork lineage and Claude sidechain import remain
-non-transferable. They are discoverable in the catalog and fail closed.
+Claude sidechain import remains non-transferable; it is discoverable in the
+catalog and fails closed. A Codex `history_base` continuation is transferable
+when the earlier rollout segment it names is present.
 
 ## Functional requirements
 

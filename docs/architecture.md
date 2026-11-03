@@ -50,8 +50,9 @@ replaced, or truncated file fails with a retryable error.
   excludes inactive branches/meta prompts.
 - Codex replays canonical `response_item` history for both legacy and paginated
   rollouts, deduplicates UI projections, filters injected user-role context
-  against the UI transcript, and rejects `history_base` lineage or an incomplete
-  paginated ordinal chain.
+  against the UI transcript, rebuilds a `history_base` continuation from the
+  earlier rollout segment it names, and rejects an incomplete paginated ordinal
+  chain.
 - Pi follows the v3 `id`/`parentId` active tree and rejects unsupported schema
   versions.
 - OMP follows its v3 active tree after validating the fixed 256-byte title

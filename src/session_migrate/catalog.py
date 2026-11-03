@@ -2077,7 +2077,6 @@ def _scan_file(path: Path, agent_format: AgentFormat, root: Path) -> _Scan:
     started_at = None
     cli_version = None
     history_mode = None
-    history_base = False
     codex_ordinals_broken = False
     codex_previous_ordinal: int | None = None
     sidechain = False
@@ -2126,7 +2125,11 @@ def _scan_file(path: Path, agent_format: AgentFormat, root: Path) -> _Scan:
                 if isinstance(ordinal, bool) or not isinstance(ordinal, int):
                     codex_ordinals_broken = True
                 elif codex_previous_ordinal is None:
-                    codex_ordinals_broken = codex_ordinals_broken or ordinal != 0
+                    # A continuation segment starts where its history_base ends.
+                    continues = payload.get("history_base") is not None
+                    codex_ordinals_broken = codex_ordinals_broken or (
+                        ordinal != 0 and not continues
+                    )
                     codex_previous_ordinal = ordinal
                 else:
                     if ordinal < codex_previous_ordinal:
@@ -2145,7 +2148,6 @@ def _scan_file(path: Path, agent_format: AgentFormat, root: Path) -> _Scan:
                     )
                     cli_version = cli_version or _string(payload.get("cli_version"))
                     history_mode = history_mode or _string(payload.get("history_mode"))
-                    history_base = history_base or payload.get("history_base") is not None
                 elif record_type == "response_item":
                     has_conversation = has_conversation or payload.get("type") in {
                         "message",
@@ -2279,8 +2281,6 @@ def _scan_file(path: Path, agent_format: AgentFormat, root: Path) -> _Scan:
             status, reason = "corrupt", "missing_session_meta"
         elif history_mode and history_mode not in codex.SUPPORTED_HISTORY_MODES:
             status, reason = "unsupported", "codex_history_mode"
-        elif history_base:
-            status, reason = "unsupported", "codex_history_base"
         elif history_mode == "paginated" and codex_ordinals_broken:
             status, reason = "unsupported", "codex_paginated_ordinals"
         elif not has_conversation:

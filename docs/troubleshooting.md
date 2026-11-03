@@ -275,17 +275,23 @@ separately authenticated Devin installation; session-migrate never copies
 credentials. See the [Hermes](hermes-format.md),
 [MastraCode](mastracode-format.md), and [Devin](devin-format.md) format notes.
 
-## Codex history-base fork source
+## Codex continued threads
 
-`history_base` lineage is recognized but unsupported: the referenced base thread
-lives in another file, so importing this one alone would silently drop the
-earlier turns. `--format codex` cannot bypass the guard.
+Codex 0.166 continues a long thread in a new rollout segment named
+`rollout-<time>-<id>_<suffix>.jsonl`. Its `session_meta.history_base` names the
+thread, the exclusive end ordinal, and the byte offset where the earlier segment
+is cut; the new segment does not repeat the earlier turns. Transfer by session ID
+uses the latest segment and reads the earlier one from the same Codex home (or
+the same directory), so the whole thread migrates. Before this, the oldest
+segment was chosen and the migrated session ended where that file stopped.
 
-Paginated rollouts are supported. A paginated file is still rejected when its
-`ordinal` chain cannot prove completeness — a missing or non-integer ordinal, a
-decreasing ordinal, or a first ordinal other than zero all mean this file is
-only part of the thread. Real `history_base` continuations start mid-stream and
-fail this check independently.
+`Codex history_base thread ... was not found up to ordinal N` means the earlier
+segment is missing, or its bytes do not end at the declared offset and ordinal.
+Keep the earlier rollout file in the Codex home or next to the newer one.
+
+A paginated file is still rejected when its `ordinal` chain cannot prove
+completeness: a missing or non-integer ordinal, a decreasing ordinal, or a first
+ordinal other than zero without a `history_base`.
 
 ## Claude sidechain/subagent
 

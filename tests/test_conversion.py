@@ -1007,7 +1007,7 @@ def test_rejects_unknown_history_mode_and_expands_replacement_history(tmp_path: 
     lineage["payload"]["history_mode"] = "paginated"
     lineage["payload"]["history_base"] = {"thread_id": "33333333-3333-4333-8333-333333333333"}
     lineage_path = write_jsonl(tmp_path / "lineage.jsonl", [lineage])
-    with pytest.raises(SessionMigrateError, match="history_base"):
+    with pytest.raises(SessionMigrateError, match="history_base is malformed"):
         codex.parse(lineage_path)
 
     replacement_path = write_jsonl(
@@ -2053,3 +2053,96 @@ def test_claude_writer_never_emits_an_empty_error_tool_result(
 
     assert [(block["content"], block["is_error"]) for block in results] == [(expected, is_error)]
     assert artifact.dropped.get("tool_result:empty_error_output", 0) == int(is_error)
+
+
+CODEX_THREAD = "22222222-2222-4222-8222-222222222222"
+
+
+def assistant_response_item(ordinal: int, text: str) -> dict[str, object]:
+    return paginated_record(
+        ordinal,
+        "response_item",
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    )
+
+
+def codex_continued_thread(tmp_path: Path, *, offset_shift: int = 0) -> tuple[Path, Path]:
+    """A base rollout whose last turn was aborted, and the segment that replaced it."""
+
+    sessions = tmp_path / "codex" / "sessions"
+    base_records = [
+        paginated_meta(tmp_path),
+        user_response_item(1, "first prompt"),
+        assistant_response_item(2, "first answer"),
+        user_response_item(3, "aborted prompt"),
+    ]
+    base = sessions / "2026" / "08" / "17" / f"rollout-2026-08-17T12-00-00-{CODEX_THREAD}.jsonl"
+    base.parent.mkdir(parents=True)
+    write_jsonl(base, base_records)
+    cut = sum(len(json.dumps(record).encode()) + 1 for record in base_records[:3])
+    meta = paginated_meta(
+        tmp_path,
+        history_base={
+            "thread_id": CODEX_THREAD,
+            "end_ordinal_exclusive": 3,
+            "end_byte_offset": cut + offset_shift,
+        },
+    )
+    meta["ordinal"] = 3
+    continuation = (
+        sessions
+        / "2026"
+        / "08"
+        / "18"
+        / f"rollout-2026-08-18T09-00-00-{CODEX_THREAD}_33333333-3333-4333-8333-333333333333.jsonl"
+    )
+    continuation.parent.mkdir(parents=True)
+    write_jsonl(
+        continuation,
+        [meta, user_response_item(4, "second prompt"), assistant_response_item(5, "second answer")],
+    )
+    return base, continuation
+
+
+def test_codex_continuation_reads_its_history_base_without_the_aborted_tail(
+    tmp_path: Path,
+) -> None:
+    """Codex 0.166 continues a thread in a new segment instead of copying its history."""
+
+    _, continuation = codex_continued_thread(tmp_path)
+
+    session = codex.parse(continuation)
+
+    assert [
+        (event.role, event.text) for event in session.events if event.kind == EventKind.MESSAGE
+    ] == [
+        (Role.USER, "first prompt"),
+        (Role.ASSISTANT, "first answer"),
+        (Role.USER, "second prompt"),
+        (Role.ASSISTANT, "second answer"),
+    ]
+    assert session.session_id == CODEX_THREAD
+
+
+@pytest.mark.parametrize("damage", ["missing_base", "wrong_offset"])
+def test_codex_continuation_fails_without_its_exact_base(tmp_path: Path, damage: str) -> None:
+    base, continuation = codex_continued_thread(
+        tmp_path, offset_shift=1 if damage == "wrong_offset" else 0
+    )
+    if damage == "missing_base":
+        base.unlink()
+
+    with pytest.raises(SessionMigrateError, match="was not found up to ordinal 3"):
+        codex.parse(continuation)
+
+
+def test_codex_session_id_locates_the_latest_segment(tmp_path: Path) -> None:
+    from session_migrate.discovery import locate_session
+
+    _, continuation = codex_continued_thread(tmp_path)
+
+    assert locate_session(AgentFormat.CODEX, CODEX_THREAD, tmp_path / "codex") == continuation

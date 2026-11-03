@@ -12,6 +12,7 @@ from pathlib import Path
 from session_migrate.errors import SessionMigrateError
 from session_migrate.formats import (
     claude,
+    codex,
     cursor,
     devin,
     grok,
@@ -142,9 +143,17 @@ def _claude_matches(home: Path, session_id: str, cwd: Path | None) -> list[Path]
 
 
 def _codex_matches(home: Path, session_id: str) -> list[Path]:
-    active = home.glob(f"sessions/*/*/*/rollout-*-{session_id}.jsonl")
-    archived = (home / "archived_sessions").glob(f"rollout-*-{session_id}.jsonl")
-    return [*active, *archived]
+    # Codex continues a long thread in a new segment named ``...-<id>_<suffix>.jsonl``;
+    # the latest segment reads the earlier ones through its history_base.
+    matches: list[Path] = []
+    for pattern in (f"rollout-*-{session_id}.jsonl", f"rollout-*-{session_id}_*.jsonl"):
+        matches += home.glob(f"sessions/*/*/*/{pattern}")
+        matches += (home / "archived_sessions").glob(pattern)
+    files = [path for path in matches if path.is_file()]
+    if len(files) < 2:
+        return files
+    latest = max(codex.rollout_segment_order(path) for path in files)
+    return [path for path in files if codex.rollout_segment_order(path) == latest]
 
 
 def _pi_matches(home: Path, session_id: str, cwd: Path | None) -> list[Path]:

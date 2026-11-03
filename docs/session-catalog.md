@@ -178,8 +178,10 @@ total transcript corpus.
 
 Consequently, archived sessions, duplicate UUIDs, nested sidechains/subagents,
 malformed files, and absent Copilot/Cursor native stores remain discoverable. Claude
-sidechains and Codex `history_base`/incomplete-ordinal sessions are listed as
-`unsupported`; listing them does not make them convertible.
+sidechains and Codex incomplete-ordinal sessions are listed as `unsupported`;
+listing them does not make them convertible. A Codex thread continued across
+rollout segments is listed once per segment under the same session ID; transfer
+by that ID uses the latest segment.
 
 ## Quick start
 
