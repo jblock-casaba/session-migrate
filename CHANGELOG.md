@@ -6,6 +6,13 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Read Antigravity conversations whose context was cleared, instead of failing
+  with `Antigravity step oneof payload is missing`. A clear marks earlier steps
+  cleared (status 5) and may drop their payloads, including planner tool calls
+  whose results remain. Emptied tool steps still answer their calls, results
+  whose calls were cleared away are counted rather than written unpaired (which
+  Claude rejects), cleared prompts are recovered from their rich-text items, and
+  the clear is a `--since-last-compaction` boundary.
 - Migrate Codex threads that continue across rollout segments. Codex 0.166 writes
   a continuation as `rollout-<time>-<id>_<suffix>.jsonl` whose `history_base`
   points into the earlier segment instead of repeating it. Transfer by session ID

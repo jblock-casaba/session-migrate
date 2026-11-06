@@ -81,8 +81,11 @@ MAX_TEXT_BYTES = 64 * 1024 * 1024
 PROJECT_ID = "default-cli-project"
 
 STEP_STATUS_DONE = 3
+# A cleared step left the model's context; the CLI may also drop its payload.
+STEP_STATUS_CLEARED = 5
 STEP_STATUS_CANCELED = 6
 CANCELED_TOOL_RESULT = "The tool call was cancelled before it returned a result."
+CLEARED_TOOL_RESULT = "This tool result was cleared from the conversation."
 STEP_STATUS_ERROR = 7
 STEP_TYPE_USER_INPUT = 14
 STEP_TYPE_PLANNER_RESPONSE = 15
@@ -112,6 +115,11 @@ _STEP_PAYLOAD_FIELDS = {
     STEP_TYPE_WRITE_BLOB: 142,
     STEP_TYPE_GENERIC: 140,
 }
+
+# Step types whose row answers the oldest pending planner tool call.
+_RESULT_STEP_TYPES = frozenset(
+    {STEP_TYPE_GENERIC, STEP_TYPE_RUN_COMMAND, STEP_TYPE_VIEW_FILE, STEP_TYPE_SHELL_EXEC}
+)
 
 _CONVERSATION_SCHEMA: dict[str, tuple[str, ...]] = {
     "trajectory_meta": ("trajectory_id", "cascade_id", "trajectory_type", "source"),
@@ -1068,16 +1076,23 @@ def _validate_step(data: bytes, *, step_type: int, status: int, generated: bool)
     }:
         raise SessionMigrateError("generated Antigravity database contains unsupported step type")
     if expected_payload_field is not None:
-        nested = _required_bytes(fields, expected_payload_field, "step oneof payload")
-        _validate_known_step_payload(step_type, nested, generated=generated)
+        nested = _optional_bytes(fields, expected_payload_field)
+        if nested is not None:
+            _validate_known_step_payload(
+                step_type, nested, generated=generated, cleared=status == STEP_STATUS_CLEARED
+            )
+        elif generated or status != STEP_STATUS_CLEARED:
+            raise SessionMigrateError("Antigravity step oneof payload is missing")
     elif generated:
         raise SessionMigrateError("generated Antigravity step has no pinned payload mapping")
 
 
-def _validate_known_step_payload(step_type: int, data: bytes, *, generated: bool) -> None:
+def _validate_known_step_payload(
+    step_type: int, data: bytes, *, generated: bool, cleared: bool = False
+) -> None:
     fields = _decode_message(data)
     if step_type == STEP_TYPE_USER_INPUT:
-        if _optional_text(fields, 2) is None and _optional_text(fields, 1) is None:
+        if _user_text(fields) is None and not cleared:
             raise SessionMigrateError("Antigravity user step contains no readable text")
     elif step_type == STEP_TYPE_PLANNER_RESPONSE:
         response = _optional_text(fields, 1)
@@ -1118,15 +1133,55 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
     events: list[Event] = []
     pending: deque[tuple[str, str]] = deque()
     emitted_calls: Counter[str] = Counter()
+    known_calls: set[str] = set()
+    previous_status: int | None = None
     for row in rows:
         outer = _decode_message(row.payload)
         payload_number = _STEP_PAYLOAD_FIELDS.get(row.step_type)
         payload = _optional_bytes(outer, payload_number) if payload_number else None
         provenance = Provenance(row.index, f"antigravity_step_{row.step_type}")
         timestamp = _step_timestamp(row.metadata)
+        if previous_status == STEP_STATUS_CLEARED and row.status != STEP_STATUS_CLEARED:
+            # The steps before a context clear left the model's context, as at a
+            # compaction without a summary.
+            events.append(
+                Event(
+                    kind=EventKind.COMPACTION,
+                    timestamp=timestamp,
+                    payload={"source_subtype": "context_cleared"},
+                    provenance=provenance,
+                )
+            )
+        previous_status = row.status
+        if payload is None and payload_number is not None and row.status == STEP_STATUS_CLEARED:
+            # Keep answering the call an emptied tool step belonged to, so later results
+            # stay paired with their own calls.
+            if row.step_type in _RESULT_STEP_TYPES and pending:
+                call_id, tool_name = pending.popleft()
+                events.append(
+                    Event(
+                        kind=EventKind.TOOL_RESULT,
+                        role=Role.TOOL,
+                        text=CLEARED_TOOL_RESULT,
+                        tool_name=tool_name,
+                        tool_call_id=call_id,
+                        timestamp=timestamp,
+                        payload={
+                            "is_error": False,
+                            "content_blocks": [{"type": "text", "text": CLEARED_TOOL_RESULT}],
+                        },
+                        provenance=provenance,
+                    )
+                )
+            events.append(_opaque_event(row, "antigravity_cleared_step_without_payload", timestamp))
+            continue
         if row.step_type == STEP_TYPE_USER_INPUT and payload is not None:
             fields = _decode_message(payload)
-            text = _optional_text(fields, 2) or _optional_text(fields, 1)
+            text = _user_text(fields)
+            if not text and row.status == STEP_STATUS_CLEARED:
+                events.append(
+                    _opaque_event(row, "antigravity_cleared_step_without_payload", timestamp)
+                )
             if text:
                 events.append(
                     Event(
@@ -1168,6 +1223,7 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
             for block_index, call_data in enumerate(call_values):
                 call_id, name, arguments = _decode_tool_call(call_data)
                 emitted_calls[call_id] += 1
+                known_calls.add(call_id)
                 pending.append((call_id, name))
                 events.append(
                     Event(
@@ -1186,7 +1242,12 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
                     )
                 )
             if not response and not call_values and not has_thinking:
-                events.append(_opaque_event(row, "antigravity_empty_planner_response", timestamp))
+                reason = (
+                    "antigravity_cleared_step_without_payload"
+                    if row.status == STEP_STATUS_CLEARED
+                    else "antigravity_empty_planner_response"
+                )
+                events.append(_opaque_event(row, reason, timestamp))
             continue
         if row.step_type == STEP_TYPE_GENERIC and payload is not None:
             fields = _decode_message(payload)
@@ -1213,6 +1274,11 @@ def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
             if pending_index is not None:
                 call_id, tool_name = pending[pending_index]
                 del pending[pending_index]
+            elif not pending and linked_call_id not in known_calls:
+                # Its call is gone (clearing drops planner steps but may keep results);
+                # a result without a call is invalid in targets that pair them.
+                events.append(_opaque_event(row, "antigravity_tool_result_without_call", timestamp))
+                continue
             else:
                 call_id, tool_name = pending.popleft() if pending else (linked_call_id, "generic")
             events.append(
@@ -1329,7 +1395,9 @@ def _project_observed_tool(
         result_text = _optional_text(fields, 3) or _optional_text(fields, 4)
     else:
         return None
-    call_id, queued_name = pending.popleft() if pending else (None, tool_name)
+    if not pending:
+        return _opaque_event(row, "antigravity_tool_result_without_call", timestamp)
+    call_id, queued_name = pending.popleft()
     return Event(
         kind=EventKind.TOOL_RESULT,
         role=Role.TOOL,
@@ -1366,6 +1434,22 @@ def _decode_tool_call(data: bytes) -> tuple[str, str, Any]:
     except (json.JSONDecodeError, ValueError, SessionMigrateError) as exc:
         raise SessionMigrateError("Antigravity tool arguments are not bounded JSON") from exc
     return call_id, name, arguments
+
+
+def _user_text(fields: Sequence[_WireField]) -> str | None:
+    """Return a user step's text, falling back to its rich-text items (field 3).
+
+    The items join to the same text when both are present; a cleared step may
+    keep only the items.
+    """
+
+    text = _optional_text(fields, 2) or _optional_text(fields, 1)
+    if text:
+        return text
+    items = "".join(
+        _optional_text(_decode_message(item), 1) or "" for item in _bytes_values(fields, 3)
+    )
+    return items or None
 
 
 def _step_error_text(fields: Sequence[_WireField]) -> str | None:

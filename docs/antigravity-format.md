@@ -227,6 +227,24 @@ text when present, otherwise the step's error message (field `31`, mirrored in
 message says it was cancelled, since an empty error result is invalid for Claude.
 An empty conversation fails as empty.
 
+Step statuses, read from the `CortexStepStatus` enum descriptor in `agy` 1.5.2:
+`1` pending, `2` running, `3` done, `4` invalid, `5` cleared, `6` canceled,
+`7` error, `8` generating, `9` waiting, `11` queued, `12` interrupted.
+
+A context clear marks every earlier step `5` (cleared): the steps stay in the
+database but leave the model's context, and the CLI may drop a cleared step's
+payload entirely, keeping only its type, status, and metadata. Cleared planner
+steps often lose their tool calls while the tool results after them keep their
+output. The reader accepts a cleared step without a payload; an emptied tool step
+still answers its pending call with a fixed notice so later results stay paired,
+and a result whose call was cleared away is counted as
+`antigravity_tool_result_without_call` instead of becoming an unpaired result.
+A cleared user step that lost its text is recovered from its rich-text items
+(field `3`, whose texts join to field `2` on intact steps). Emptied cleared steps
+are counted as `antigravity_cleared_step_without_payload`. The first step after a
+clear starts a compaction boundary without a summary, so `--since-last-compaction`
+cuts there when no later checkpoint exists.
+
 A checkpoint step (type `23`, payload field `30`) holds a plaintext `<summary>` in
 field `5`, its own step index in field `12`, and the previous checkpoint's index in
 field `11`. Later model calls send the summary and the steps after it, so the

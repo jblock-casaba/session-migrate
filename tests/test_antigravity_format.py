@@ -746,3 +746,115 @@ def test_checkpoint_summary_is_a_compaction_boundary_carried_into_claude(
         {"role": "user", "content": "AGY_AFTER_CHECKPOINT"},
     ]
     assert artifact.dropped["compaction:summary_as_user_message"] == 1
+
+
+def rewrite_steps(path: Path, changes: dict[int, tuple[int, bytes | None]]) -> None:
+    """Set a step's status and replace (or drop, with None) its oneof payload."""
+
+    with sqlite3.connect(path) as db:
+        for index, (status, oneof) in changes.items():
+            step_type, payload = db.execute(
+                "SELECT step_type, step_payload FROM steps WHERE idx=?", (index,)
+            ).fetchone()
+            field = antigravity._STEP_PAYLOAD_FIELDS[step_type]
+            current = next(
+                f.value for f in antigravity._decode_message(payload) if f.number == field
+            )
+            rebuilt = antigravity._field_varint(1, step_type) + antigravity._field_varint(4, status)
+            replacement = current if oneof == b"keep" else oneof
+            if replacement is not None:
+                rebuilt += antigravity._field_bytes(field, replacement)
+            db.execute(
+                "UPDATE steps SET status=?, step_payload=? WHERE idx=?", (status, rebuilt, index)
+            )
+
+
+def append_live_user_step(path: Path, text: str) -> None:
+    with sqlite3.connect(path) as db:
+        index = db.execute("SELECT count(*) FROM steps").fetchone()[0]
+        payload = (
+            antigravity._field_varint(1, antigravity.STEP_TYPE_USER_INPUT)
+            + antigravity._field_varint(4, antigravity.STEP_STATUS_DONE)
+            + antigravity._field_bytes(19, antigravity._field_text(2, text))
+        )
+        db.execute(
+            "INSERT INTO steps(idx,step_type,status,step_payload) VALUES(?,?,?,?)",
+            (index, antigravity.STEP_TYPE_USER_INPUT, antigravity.STEP_STATUS_DONE, payload),
+        )
+
+
+def cleared_conversation(tmp_path: Path, changes: dict[int, tuple[int, bytes | None]]) -> Path:
+    """The fixture's four steps (user, reply, tool call, tool result) after a context clear."""
+
+    path = tmp_path / f"{TARGET_ID}.db"
+    path.write_bytes(serialized(tmp_path))
+    cleared = antigravity.STEP_STATUS_CLEARED
+    rewrite_steps(path, {index: (cleared, b"keep") for index in range(4)} | changes)
+    append_live_user_step(path, "AGY_AFTER_CLEAR")
+    return path
+
+
+def reasons(session: Session) -> list[object]:
+    return [
+        event.payload.get("reason") for event in session.events if event.kind == EventKind.OPAQUE
+    ]
+
+
+def test_emptied_cleared_tool_step_still_answers_its_call(tmp_path: Path) -> None:
+    cleared = antigravity.STEP_STATUS_CLEARED
+    path = cleared_conversation(tmp_path, {3: (cleared, None)})
+
+    session = antigravity.parse_session(path)
+
+    assert tool_results(session.events) == [("agy-call-1", antigravity.CLEARED_TOOL_RESULT, False)]
+    assert "antigravity_cleared_step_without_payload" in reasons(session)
+
+
+def test_tool_result_whose_call_was_cleared_away_is_not_left_unpaired(tmp_path: Path) -> None:
+    cleared = antigravity.STEP_STATUS_CLEARED
+    path = cleared_conversation(tmp_path, {2: (cleared, b"")})
+
+    session = antigravity.parse_session(path)
+
+    assert tool_results(session.events) == []
+    assert not [event for event in session.events if event.kind == EventKind.TOOL_CALL]
+    assert "antigravity_tool_result_without_call" in reasons(session)
+
+
+def test_cleared_user_step_text_is_recovered_from_its_items(tmp_path: Path) -> None:
+    cleared = antigravity.STEP_STATUS_CLEARED
+    items = antigravity._field_bytes(3, antigravity._field_text(1, "AGY_ITEM_TEXT"))
+    path = cleared_conversation(tmp_path, {0: (cleared, items)})
+
+    session = antigravity.parse_session(path)
+
+    assert [event.text for event in session.events if event.role == Role.USER and event.text] == [
+        "AGY_ITEM_TEXT",
+        "AGY_AFTER_CLEAR",
+    ]
+
+
+def test_context_clear_is_a_boundary_before_the_first_live_step(tmp_path: Path) -> None:
+    from session_migrate.conversion import truncate_to_last_compaction
+
+    cleared = antigravity.STEP_STATUS_CLEARED
+    path = cleared_conversation(tmp_path, {0: (cleared, b"")})
+
+    session = antigravity.parse_session(path)
+    trimmed, stats = truncate_to_last_compaction(session)
+
+    assert "antigravity_cleared_step_without_payload" in reasons(session)
+    assert [event.payload.get("source_subtype") for event in trimmed.events[:1]] == [
+        "context_cleared"
+    ]
+    assert [event.text for event in trimmed.events if event.text] == ["AGY_AFTER_CLEAR"]
+    assert stats["events_before_boundary"] > 0
+
+
+def test_only_cleared_steps_may_lose_their_payload(tmp_path: Path) -> None:
+    path = tmp_path / f"{TARGET_ID}.db"
+    path.write_bytes(serialized(tmp_path))
+    rewrite_steps(path, {3: (antigravity.STEP_STATUS_DONE, None)})
+
+    with pytest.raises(SessionMigrateError, match="step oneof payload is missing"):
+        antigravity.parse_session(path)
