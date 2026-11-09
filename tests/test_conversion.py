@@ -973,8 +973,8 @@ def test_load_session_rejects_source_change_during_parse(
     )
     original_parse = claude.parse
 
-    def parse_then_append(source_path: Path) -> Session:
-        session = original_parse(source_path)
+    def parse_then_append(source_path: Path, **options: bool) -> Session:
+        session = original_parse(source_path, **options)
         with source_path.open("a") as stream:
             stream.write("{}\n")
         return session
@@ -2146,3 +2146,66 @@ def test_codex_session_id_locates_the_latest_segment(tmp_path: Path) -> None:
     _, continuation = codex_continued_thread(tmp_path)
 
     assert locate_session(AgentFormat.CODEX, CODEX_THREAD, tmp_path / "codex") == continuation
+
+
+@pytest.mark.parametrize("layout", ["tail_after_summary", "logical_parent_is_tail"])
+def test_claude_window_load_matches_a_full_parse_cut_at_the_same_compaction(
+    tmp_path: Path, layout: str
+) -> None:
+    path = preserved_compaction(tmp_path, layout)
+
+    def signature(session: Session) -> list[tuple[object, ...]]:
+        return [
+            (event.kind, event.role, event.text, event.payload.get("reason"))
+            for event in conversion.truncate_to_last_compaction(session)[0].events
+        ]
+
+    assert signature(claude.parse(path, since_last_compaction=True)) == signature(
+        claude.parse(path)
+    )
+
+
+def test_claude_window_load_rereads_only_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Old history is indexed but never loaded, so the file's total size does not matter."""
+
+    path = preserved_compaction(tmp_path, "tail_after_summary")
+    loaded: list[object] = []
+    original = claude.reread_jsonl
+
+    def recording(source: Path, locations: object, **limits: int) -> list[object]:
+        records = original(source, locations, **limits)  # type: ignore[arg-type]
+        loaded.extend(record.value.get("uuid") for record in records)
+        return records
+
+    monkeypatch.setattr(claude, "reread_jsonl", recording)
+    claude.parse(path, since_last_compaction=True)
+
+    assert "u0" not in loaded and "a0" not in loaded
+    assert {"summary", "u1", "a1", "a2"} <= set(loaded)
+
+
+def test_claude_window_load_without_compaction_fails_early(tmp_path: Path) -> None:
+    cwd = str(tmp_path)
+    path = write_jsonl(
+        tmp_path / "plain.jsonl",
+        [
+            claude_record("user", "u1", None, "hello", cwd=cwd),
+            claude_record("assistant", "a1", "u1", "hi", cwd=cwd),
+        ],
+    )
+
+    with pytest.raises(SessionMigrateError, match="found no compaction boundary"):
+        claude.parse(path, since_last_compaction=True)
+
+
+def test_reread_window_is_bounded_like_one_file(tmp_path: Path) -> None:
+    from session_migrate.jsonl import iter_jsonl, reread_jsonl
+
+    path = write_jsonl(tmp_path / "records.jsonl", [{"n": index} for index in range(3)])
+    located = list(iter_jsonl(path))
+
+    assert [record.value for record in reread_jsonl(path, located[1:])] == [{"n": 1}, {"n": 2}]
+    with pytest.raises(JsonlError, match="window exceeds"):
+        reread_jsonl(path, located, max_total_bytes=located[0].byte_length)

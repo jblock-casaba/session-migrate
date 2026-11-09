@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
 from collections import Counter, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,16 @@ from session_migrate.formats.common import (
     string,
     valid_rfc3339,
 )
-from session_migrate.jsonl import JsonlRecord, encode_jsonl, file_sha256, iter_jsonl
+from session_migrate.jsonl import (
+    SCAN_MAX_RECORDS,
+    SCAN_MAX_TOTAL_BYTES,
+    JsonlError,
+    JsonlRecord,
+    encode_jsonl,
+    file_sha256,
+    iter_jsonl,
+    reread_jsonl,
+)
 from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Role, Session
 
 PINNED_CLAUDE_VERSION = "2.1.209"
@@ -29,6 +40,26 @@ EMPTY_ERROR_RESULT = "The tool reported an error without output."
 COMPACTION_SUMMARY_HEADING = "Summary of the earlier part of this conversation:"
 TITLE_TYPES = {"custom-title": "customTitle", "ai-title": "aiTitle"}
 _REPEATED_RECORD_METADATA = frozenset({"promptId", "slug"})
+# Fields the active-graph walk and session metadata read; an index pass keeps only these.
+_INDEX_FIELDS = (
+    "type",
+    "subtype",
+    "uuid",
+    "parentUuid",
+    "logicalParentUuid",
+    "isSidechain",
+    "isMeta",
+    "isCompactSummary",
+    "compactMetadata",
+    "leafUuid",
+    "sessionId",
+    "cwd",
+    "timestamp",
+    "version",
+    "promptId",
+    "slug",
+    *TITLE_TYPES.values(),
+)
 
 # Claude records slash commands, their local output, and background task notices as
 # user-role turns. They are model input but never a prompt the human typed, so importing
@@ -58,11 +89,21 @@ CONTEXTUAL_USER_WRAPPERS: tuple[str, ...] = (
 )
 
 
-def parse(path: Path) -> Session:
-    records = list(iter_jsonl(path))
-    unique_records, duplicate_indices = _deduplicate_records(records)
-    selected_records = _active_conversation_records(unique_records)
-    selected = {record.index for record in selected_records}
+def parse(path: Path, *, since_last_compaction: bool = False) -> Session:
+    """Parse a transcript's active conversation.
+
+    ``since_last_compaction`` loads only the active branch from its last compaction
+    boundary. The file is scanned once for an index, so its total size does not
+    matter; the usual size limits apply to the records loaded.
+    """
+
+    if since_last_compaction:
+        records, selected_records, active, duplicate_indices = _compaction_window(path)
+    else:
+        records = list(iter_jsonl(path))
+        unique_records, duplicate_indices = _deduplicate_records(records)
+        selected_records = _active_conversation_records(unique_records)
+        active = {record.index for record in selected_records}
     selected_session_ids = {
         string(record.value.get("sessionId"))
         for record in selected_records
@@ -180,12 +221,13 @@ def parse(path: Path) -> Session:
         if value.get("toolUseResult") is not None or value.get("sourceToolAssistantUUID"):
             events.append(_opaque_event(record, "top_level_tool_result_metadata"))
 
-    # Non-selected records are accounting-only and cannot affect replay order.
+    # Non-selected records are accounting-only and cannot affect replay order. Active
+    # records before a loaded window are dropped with the history the window replaces.
     for record in records:
         if record.index in duplicate_indices:
             events.append(_opaque_event(record, "duplicate_record_uuid"))
             continue
-        if record.index in selected:
+        if record.index in active:
             continue
         value = record.value
         record_type = string(value.get("type"))
@@ -197,7 +239,11 @@ def parse(path: Path) -> Session:
     return Session(
         source_format=AgentFormat.CLAUDE,
         source_path=path.resolve(),
-        source_sha256=file_sha256(path),
+        source_sha256=(
+            file_sha256(path, max_total_bytes=SCAN_MAX_TOTAL_BYTES)
+            if since_last_compaction
+            else file_sha256(path)
+        ),
         session_id=session_id,
         cwd=Path(cwd) if cwd else None,
         started_at=started_at,
@@ -417,6 +463,76 @@ def serialize(
             }
         )
     return encode_jsonl(emitted), dict(sorted(dropped.items()))
+
+
+def _compaction_window(
+    path: Path,
+) -> tuple[list[JsonlRecord], list[JsonlRecord], set[int], set[int]]:
+    """Index a transcript, then load the active branch from its last compaction.
+
+    Returns the index records (for metadata and accounting), the loaded window, the
+    indices of the whole active branch, and the indices of repeated UUID copies.
+    """
+
+    index = [
+        replace(record, value=_index_value(record.value))
+        for record in iter_jsonl(
+            path, max_total_bytes=SCAN_MAX_TOTAL_BYTES, max_records=SCAN_MAX_RECORDS
+        )
+    ]
+    # Repeated UUIDs must match in full content, which the index does not keep.
+    counts = Counter(string(record.value.get("uuid")) for record in index)
+    repeated = [record for record in index if counts[string(record.value.get("uuid"))] > 1]
+    content = {
+        record.index: _content_digest(record.value)
+        for record in reread_jsonl(path, repeated)
+        if string(record.value.get("uuid"))
+    }
+    index = [
+        replace(record, value={**record.value, "_content": content[record.index]})
+        if record.index in content
+        else record
+        for record in index
+    ]
+    unique_records, duplicate_indices = _deduplicate_records(index)
+    chain = _active_conversation_records(unique_records)
+    boundaries = [
+        position
+        for position, record in enumerate(chain)
+        if record.value.get("type") == "system"
+        and record.value.get("subtype") == "compact_boundary"
+    ]
+    summaries = [
+        position
+        for position, record in enumerate(chain)
+        if record.value.get("isCompactSummary") is True
+    ]
+    start = (boundaries or summaries or [None])[-1]
+    if start is None:
+        raise SessionMigrateError(
+            "--since-last-compaction found no compaction boundary in this session; "
+            "the full transcript is already its effective window"
+        )
+    window = reread_jsonl(path, chain[start:])
+    if any(
+        string(full.value.get("uuid")) != string(located.value.get("uuid"))
+        for full, located in zip(window, chain[start:], strict=True)
+    ):
+        raise JsonlError("session file changed while reading; retry after it is idle")
+    return index, window, {record.index for record in chain}, duplicate_indices
+
+
+def _index_value(value: Mapping[str, Any]) -> dict[str, Any]:
+    kept = {key: value[key] for key in _INDEX_FIELDS if key in value}
+    if isinstance(value.get("message"), dict):
+        kept["message"] = {}
+    return kept
+
+
+def _content_digest(value: Mapping[str, Any]) -> str:
+    identity = {key: item for key, item in value.items() if key not in _REPEATED_RECORD_METADATA}
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def project_directory_name(cwd: Path) -> str:

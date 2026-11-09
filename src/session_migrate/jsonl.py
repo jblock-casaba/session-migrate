@@ -17,6 +17,10 @@ from session_migrate.errors import JsonlError
 DEFAULT_MAX_RECORD_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_RECORDS = 100_000
+# An index-only pass keeps a few fields per record, so it may read far larger files;
+# the default limits then apply to the records actually loaded.
+SCAN_MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
+SCAN_MAX_RECORDS = 5_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +30,8 @@ class JsonlRecord:
     index: int
     line_number: int
     value: Mapping[str, Any]
+    byte_offset: int = 0
+    byte_length: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +70,7 @@ def iter_jsonl(
             raise JsonlError(f"session file exceeds the {max_total_bytes}-byte total safety limit")
         while raw_line := stream.readline(max_record_bytes + 1):
             line_number += 1
+            byte_offset = total_bytes
             total_bytes += len(raw_line)
             if total_bytes > max_total_bytes:
                 raise JsonlError(
@@ -85,8 +92,64 @@ def iter_jsonl(
                 raise JsonlError(f"session record at line {line_number} is not a JSON object")
             if record_index >= max_records:
                 raise JsonlError(f"session file exceeds the {max_records}-record safety limit")
-            yield JsonlRecord(index=record_index, line_number=line_number, value=value)
+            yield JsonlRecord(
+                index=record_index,
+                line_number=line_number,
+                value=value,
+                byte_offset=byte_offset,
+                byte_length=len(raw_line),
+            )
             record_index += 1
+
+
+def reread_jsonl(
+    path: Path,
+    locations: Iterable[JsonlRecord],
+    *,
+    max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    max_records: int = DEFAULT_MAX_RECORDS,
+) -> list[JsonlRecord]:
+    """Load the full records an index pass located, bounded as one ordinary file."""
+
+    records: list[JsonlRecord] = []
+    total_bytes = 0
+    try:
+        stream = path.open("rb")
+    except OSError as exc:
+        raise JsonlError(f"cannot open session file {path}: {exc.strerror or exc}") from exc
+    with stream:
+        for location in locations:
+            total_bytes += location.byte_length
+            if total_bytes > max_total_bytes:
+                raise JsonlError(
+                    f"the loaded session window exceeds the {max_total_bytes}-byte safety limit"
+                )
+            if len(records) >= max_records:
+                raise JsonlError(
+                    f"the loaded session window exceeds the {max_records}-record safety limit"
+                )
+            stream.seek(location.byte_offset)
+            raw_line = stream.read(location.byte_length)
+            try:
+                value = json.loads(raw_line.strip(), parse_constant=_reject_json_constant)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise JsonlError(
+                    f"session file changed while reading; line {location.line_number} differs"
+                ) from exc
+            if not isinstance(value, dict):
+                raise JsonlError(
+                    f"session file changed while reading; line {location.line_number} differs"
+                )
+            records.append(
+                JsonlRecord(
+                    index=location.index,
+                    line_number=location.line_number,
+                    value=value,
+                    byte_offset=location.byte_offset,
+                    byte_length=location.byte_length,
+                )
+            )
+    return records
 
 
 def file_sha256(

@@ -126,7 +126,14 @@ class ConversionArtifact:
         }
 
 
-def load_session(path: Path, source_format: AgentFormat | None = None) -> Session:
+def load_session(
+    path: Path,
+    source_format: AgentFormat | None = None,
+    *,
+    since_last_compaction: bool = False,
+) -> Session:
+    """Load a session; ``since_last_compaction`` lets a reader skip history it would cut."""
+
     source_format = source_format or detect_path_format(path)
     if source_format == AgentFormat.ANTIGRAVITY:
         # The adapter makes a transactionally consistent SQLite backup that
@@ -155,7 +162,7 @@ def load_session(path: Path, source_format: AgentFormat | None = None) -> Sessio
         return devin.parse_session(path)
     before = file_snapshot(path)
     if source_format == AgentFormat.CLAUDE:
-        session = claude.parse(path)
+        session = claude.parse(path, since_last_compaction=since_last_compaction)
     elif source_format == AgentFormat.CODEX:
         session = codex.parse(path)
     elif source_format == AgentFormat.PI:

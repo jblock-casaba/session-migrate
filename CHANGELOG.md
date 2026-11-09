@@ -6,6 +6,12 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Cut a Claude transcript of any size with `--since-last-compaction`. The file
+  was loaded whole before being cut, so one over the 256 MiB safety limit
+  failed even though only its tail was needed. A streaming pass now indexes the
+  transcript and only the active branch from its last compaction is read back,
+  with the size limits applied to that window; the result is identical to a full
+  parse cut at the same boundary.
 - Read Antigravity conversations whose context was cleared, instead of failing
   with `Antigravity step oneof payload is missing`. A clear marks earlier steps
   cleared (status 5) and may drop their payloads, including planner tool calls

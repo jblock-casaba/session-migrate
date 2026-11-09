@@ -203,6 +203,16 @@ still omitted because the turns they summarize are present.
 The option fails closed when a session has no compaction boundary, because the
 full transcript is already its effective window.
 
+For a Claude source the transcript is not loaded whole. One streaming pass keeps
+a small index (UUIDs, parent links, record types, byte offsets), the active
+branch is found from it, and only the records from its last compaction boundary
+on are read back, including preserved turns stored before the boundary. The
+total-size safety limit applies to that loaded window instead of the file, so a
+transcript far over 256 MiB can still be cut; per-record limits and the index
+pass's own bounds still apply. The truncation warning's
+`events_before_boundary` then counts only events inside the loaded window.
+Other sources still load the whole session before cutting it.
+
 ## Home resolution
 
 | Format | Default source/target root |

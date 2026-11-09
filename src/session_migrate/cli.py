@@ -627,7 +627,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                     else:
                         assert source_path is not None
-                        session = load_session(source_path, source_format)
+                        session = load_session(
+                            source_path,
+                            source_format,
+                            since_last_compaction=args.since_last_compaction,
+                        )
                 if not session.session_id:
                     raise SessionMigrateError(
                         "discovered transcript has no native session ID metadata"
@@ -653,6 +657,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session = load_session(
                     _resolve_source(args.path, source_format),
                     source_format,
+                    since_last_compaction=args.since_last_compaction,
                 )
                 target_format = TargetFormat(args.to)
             if target_format == TargetFormat.OPENCODE and getattr(args, "home", None):
