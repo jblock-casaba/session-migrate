@@ -245,6 +245,11 @@ are counted as `antigravity_cleared_step_without_payload`. The first step after 
 clear starts a compaction boundary without a summary, so `--since-last-compaction`
 cuts there when no later checkpoint exists.
 
+A sub-agent runs in its own conversation database whose trajectory metadata
+field `6` names the root conversation, and whose picker row records the parent
+and nesting depth. Such a conversation is refused with a message naming the root
+conversation to transfer instead, as Claude sidechains are.
+
 A checkpoint step (type `23`, payload field `30`) holds a plaintext `<summary>` in
 field `5`, its own step index in field `12`, and the previous checkpoint's index in
 field `11`. Later model calls send the summary and the steps after it, so the

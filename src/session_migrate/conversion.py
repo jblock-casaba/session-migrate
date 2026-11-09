@@ -138,7 +138,7 @@ def load_session(
     if source_format == AgentFormat.ANTIGRAVITY:
         # The adapter makes a transactionally consistent SQLite backup that
         # includes live WAL state; a plain file stat/hash check would not.
-        return antigravity.parse_session(path)
+        return antigravity.parse_session(path, since_last_compaction=since_last_compaction)
     if source_format == AgentFormat.CURSOR:
         # Cursor is also a live SQLite store. Its adapter takes a consistent
         # backup including committed WAL state before projecting the graph.
@@ -164,7 +164,7 @@ def load_session(
     if source_format == AgentFormat.CLAUDE:
         session = claude.parse(path, since_last_compaction=since_last_compaction)
     elif source_format == AgentFormat.CODEX:
-        session = codex.parse(path)
+        session = codex.parse(path, since_last_compaction=since_last_compaction)
     elif source_format == AgentFormat.PI:
         session = pi.parse_session(path)
     elif source_format == AgentFormat.OMP:
@@ -174,7 +174,7 @@ def load_session(
     elif source_format == AgentFormat.KILO:
         session = kilo.parse_session(path)
     elif source_format == AgentFormat.COPILOT:
-        session = copilot.parse_session(path)
+        session = copilot.parse_session(path, since_last_compaction=since_last_compaction)
     elif source_format == AgentFormat.MUSE:
         session = muse.parse_session(path)
     elif source_format == AgentFormat.QWEN:
@@ -309,6 +309,8 @@ def truncate_to_last_compaction(session: Session) -> tuple[Session, dict[str, in
         "events_carried_forward": len(carried),
         "events_after_boundary": len(after),
     }
+    if session.records_before_window:
+        stats["records_skipped_before_window"] = session.records_before_window
     if compaction.text:
         stats["compaction_summary_carried"] = 1
     elif compaction.payload.get("replacement_history_expanded") and not carried:

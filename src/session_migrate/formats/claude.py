@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from session_migrate.errors import SessionMigrateError
+from session_migrate.errors import NoCompactionBoundaryError, SessionMigrateError
 from session_migrate.formats.common import (
     claude_source_from_image_url,
     content_text,
@@ -97,8 +97,10 @@ def parse(path: Path, *, since_last_compaction: bool = False) -> Session:
     matter; the usual size limits apply to the records loaded.
     """
 
+    skipped = 0
     if since_last_compaction:
         records, selected_records, active, duplicate_indices = _compaction_window(path)
+        skipped = len(active) - len(selected_records)
     else:
         records = list(iter_jsonl(path))
         unique_records, duplicate_indices = _deduplicate_records(records)
@@ -253,6 +255,7 @@ def parse(path: Path, *, since_last_compaction: bool = False) -> Session:
         events=tuple(events),
         raw_record_count=len(records),
         model_provider="anthropic",
+        records_before_window=skipped,
     )
 
 
@@ -509,10 +512,7 @@ def _compaction_window(
     ]
     start = (boundaries or summaries or [None])[-1]
     if start is None:
-        raise SessionMigrateError(
-            "--since-last-compaction found no compaction boundary in this session; "
-            "the full transcript is already its effective window"
-        )
+        raise NoCompactionBoundaryError
     window = reread_jsonl(path, chain[start:])
     if any(
         string(full.value.get("uuid")) != string(located.value.get("uuid"))

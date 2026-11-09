@@ -25,17 +25,22 @@ import subprocess
 import tempfile
 import uuid
 from collections import Counter, deque
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
-from session_migrate.errors import SessionMigrateError
+from session_migrate.errors import NoCompactionBoundaryError, SessionMigrateError
 from session_migrate.formats.common import content_text, string, valid_rfc3339
-from session_migrate.jsonl import write_private_atomic
+from session_migrate.jsonl import (
+    SCAN_MAX_RECORDS,
+    SCAN_MAX_TOTAL_BYTES,
+    file_sha256,
+    write_private_atomic,
+)
 from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Role, Session
 
 PINNED_ANTIGRAVITY_VERSION = "1.1.16"
@@ -225,6 +230,27 @@ class ParsedAntigravitySession:
     events: tuple[Event, ...]
     raw_record_count: int
     snapshot_sha256: str
+    records_before_window: int = 0
+
+
+class _WindowEvents(list[Event]):
+    """Keep only the latest compaction event and what follows it, as events arrive.
+
+    This is the cut ``--since-last-compaction`` makes, applied while streaming so the
+    history before the last compaction is never held at once.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.boundary: int | None = None
+        self.window_bytes = 0
+
+    def append(self, event: Event) -> None:
+        if event.kind == EventKind.COMPACTION:
+            self.clear()
+            self.boundary = event.provenance.record_index
+            self.window_bytes = 0
+        super().append(event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,19 +443,27 @@ def serialize(
     return data, dict(sorted(dropped.items()))
 
 
-def parse(path: Path) -> ParsedAntigravitySession:
-    """Read one native DB through a consistent SQLite backup snapshot."""
+def parse(path: Path, *, since_last_compaction: bool = False) -> ParsedAntigravitySession:
+    """Read one native DB through a consistent SQLite backup snapshot.
 
-    snapshot = snapshot_database_bytes(path)
-    parsed = _parse_database_bytes(snapshot, expected_session_id=_session_id_from_path(path))
+    ``since_last_compaction`` snapshots to disk, streams every step through the same
+    validation and projection, and keeps only events from the last compaction on, so
+    the database's total size does not matter.
+    """
+
+    if since_last_compaction:
+        parsed = _parse_window(path, expected_session_id=_session_id_from_path(path))
+    else:
+        snapshot = snapshot_database_bytes(path)
+        parsed = _parse_database_bytes(snapshot, expected_session_id=_session_id_from_path(path))
     title, cwd = _read_summary_metadata(path, parsed.session_id)
     return replace(parsed, title=title, cwd=cwd)
 
 
-def parse_session(path: Path) -> Session:
+def parse_session(path: Path, *, since_last_compaction: bool = False) -> Session:
     """Parse Antigravity as a first-class source without exposing private thought text."""
 
-    parsed = parse(path)
+    parsed = parse(path, since_last_compaction=since_last_compaction)
     return Session(
         source_format=AgentFormat.ANTIGRAVITY,
         source_path=path.resolve(),
@@ -443,6 +477,7 @@ def parse_session(path: Path) -> Session:
         events=parsed.events,
         raw_record_count=parsed.raw_record_count,
         model_provider="google",
+        records_before_window=parsed.records_before_window,
     )
 
 
@@ -460,6 +495,22 @@ def validate_native_bytes(data: bytes, session_id: str) -> None:
 def snapshot_database_bytes(path: Path) -> bytes:
     """Return a bounded, transactionally consistent copy, including live WAL state."""
 
+    source = _regular_source(path, MAX_NATIVE_BYTES)
+    with tempfile.TemporaryDirectory(prefix="session-migrate-antigravity-snapshot-") as directory:
+        target = Path(directory) / "snapshot.db"
+        _backup_database(source, target)
+        try:
+            data = target.read_bytes()
+        except OSError as exc:
+            raise SessionMigrateError(
+                "cannot make a consistent Antigravity database snapshot"
+            ) from exc
+    if not data or len(data) > MAX_NATIVE_BYTES:
+        raise SessionMigrateError("Antigravity database snapshot violates the safety limit")
+    return data
+
+
+def _regular_source(path: Path, limit: int) -> Path:
     source = path.expanduser()
     try:
         info = source.lstat()
@@ -467,25 +518,85 @@ def snapshot_database_bytes(path: Path) -> bytes:
         raise SessionMigrateError("cannot inspect Antigravity conversation database") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise SessionMigrateError("Antigravity conversation source must be a regular file")
-    if info.st_size > MAX_NATIVE_BYTES:
+    if info.st_size > limit:
         raise SessionMigrateError("Antigravity conversation exceeds the database safety limit")
+    return source
 
+
+def _backup_database(source: Path, target: Path) -> None:
+    uri = f"file:{quote(str(source.resolve()), safe='/')}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=5) as origin:
+            origin.execute("PRAGMA trusted_schema=OFF")
+            with sqlite3.connect(target) as destination:
+                origin.backup(destination)
+    except (OSError, sqlite3.Error) as exc:
+        raise SessionMigrateError("cannot make a consistent Antigravity database snapshot") from exc
+
+
+def _parse_window(path: Path, *, expected_session_id: str | None) -> ParsedAntigravitySession:
+    source = _regular_source(path, SCAN_MAX_TOTAL_BYTES)
     with tempfile.TemporaryDirectory(prefix="session-migrate-antigravity-snapshot-") as directory:
         target = Path(directory) / "snapshot.db"
-        uri = f"file:{quote(str(source.resolve()), safe='/')}?mode=ro"
+        _backup_database(source, target)
+        digest = file_sha256(target, max_total_bytes=SCAN_MAX_TOTAL_BYTES)
+        uri = f"file:{quote(str(target), safe='/')}?mode=ro&immutable=1"
         try:
-            with sqlite3.connect(uri, uri=True, timeout=5) as origin:
-                origin.execute("PRAGMA trusted_schema=OFF")
-                with sqlite3.connect(target) as destination:
-                    origin.backup(destination)
-            data = target.read_bytes()
-        except (OSError, sqlite3.Error) as exc:
+            connection = sqlite3.connect(uri, uri=True, timeout=5)
+        except sqlite3.Error as exc:
             raise SessionMigrateError(
-                "cannot make a consistent Antigravity database snapshot"
+                "Antigravity conversation is not a readable SQLite DB"
             ) from exc
-    if not data or len(data) > MAX_NATIVE_BYTES:
-        raise SessionMigrateError("Antigravity database snapshot violates the safety limit")
-    return data
+        with closing(connection) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA trusted_schema=OFF")
+            conversation_id, trajectory_id, rows, started_at, metadata_losses = _validate_database(
+                db,
+                expected_session_id=expected_session_id,
+                generated=False,
+                max_bytes=SCAN_MAX_TOTAL_BYTES,
+                max_steps=SCAN_MAX_RECORDS,
+            )
+            window = _WindowEvents()
+            count = 0
+
+            def measured(steps: Iterable[_StepRow]) -> Iterator[_StepRow]:
+                nonlocal count
+                for row in steps:
+                    count += 1
+                    window.window_bytes += len(row.payload) + len(row.metadata or b"")
+                    yield row
+
+            _project_events(measured(rows), events=window)
+    if window.boundary is None:
+        raise NoCompactionBoundaryError
+    if window.window_bytes > MAX_NATIVE_BYTES:
+        raise SessionMigrateError(
+            "Antigravity steps after the last compaction exceed the database safety limit"
+        )
+    events = list(window)
+    for reason, total in metadata_losses.items():
+        for number in range(total):
+            events.append(
+                Event(
+                    kind=EventKind.OPAQUE,
+                    payload={"reason": reason},
+                    provenance=Provenance(count + number, "antigravity_native_metadata"),
+                )
+            )
+    return ParsedAntigravitySession(
+        session_id=conversation_id,
+        trajectory_id=trajectory_id,
+        cwd=None,
+        started_at=started_at,
+        cli_version=PINNED_ANTIGRAVITY_VERSION,
+        model=None,
+        title=None,
+        events=tuple(events),
+        raw_record_count=count,
+        snapshot_sha256=digest,
+        records_before_window=window.boundary,
+    )
 
 
 def session_relative_path(session_id: str) -> Path:
@@ -895,12 +1006,26 @@ def _database_from_bytes(data: bytes) -> Iterator[sqlite3.Connection]:
 
 
 def _validate_database(
-    db: sqlite3.Connection, *, expected_session_id: str | None, generated: bool
-) -> tuple[str, str, tuple[_StepRow, ...], str | None, dict[str, int]]:
+    db: sqlite3.Connection,
+    *,
+    expected_session_id: str | None,
+    generated: bool,
+    max_bytes: int | None = None,
+    max_steps: int | None = None,
+) -> tuple[str, str, Sequence[_StepRow] | Iterator[_StepRow], str | None, dict[str, int]]:
+    """Validate a conversation DB; with ``max_steps`` its rows are validated lazily.
+
+    Lazy rows stream from a cursor (for a window load); otherwise all rows are
+    validated and returned under the ordinary limits.
+    """
+
+    lazy = max_steps is not None
+    max_bytes = MAX_NATIVE_BYTES if max_bytes is None else max_bytes
+    max_steps = MAX_STEPS if max_steps is None else max_steps
     try:
         page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
         page_count = int(db.execute("PRAGMA page_count").fetchone()[0])
-        if page_size <= 0 or page_count <= 0 or page_size * page_count > MAX_NATIVE_BYTES:
+        if page_size <= 0 or page_count <= 0 or page_size * page_count > max_bytes:
             raise SessionMigrateError("Antigravity database page bounds are invalid")
         result = db.execute("PRAGMA integrity_check(1)").fetchone()
         if result != ("ok",):
@@ -942,14 +1067,47 @@ def _validate_database(
         count = int(db.execute("SELECT count(*) FROM steps").fetchone()[0])
         if count == 0:
             raise SessionMigrateError("Antigravity conversation is empty; it has no steps")
-        if count > MAX_STEPS:
+        if count > max_steps:
             raise SessionMigrateError("Antigravity step count violates the safety limit")
-        sql_rows = db.execute(
+        rows = _validated_rows(db, generated=generated)
+        if not lazy:
+            rows = tuple(rows)
+        metadata_losses: Counter[str] = Counter()
+        if trajectory_metadata_loss:
+            metadata_losses["antigravity_incomplete_trajectory_metadata"] += 1
+        if len(trajectory_rows) > 1:
+            metadata_losses["antigravity_auxiliary_trajectory_metadata"] += len(trajectory_rows) - 1
+        for table in (
+            "gen_metadata",
+            "executor_metadata",
+            "parent_references",
+            "battle_mode_infos",
+        ):
+            auxiliary_count = int(db.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            if generated and auxiliary_count:
+                raise SessionMigrateError("generated Antigravity database has runtime metadata")
+            if auxiliary_count:
+                metadata_losses[f"antigravity_{table}"] += auxiliary_count
+        return (
+            conversation_id,
+            trajectory_id,
+            rows,
+            started_at,
+            dict(metadata_losses),
+        )
+    except SessionMigrateError:
+        raise
+    except sqlite3.Error as exc:
+        raise SessionMigrateError("Antigravity database schema or rows are invalid") from exc
+
+
+def _validated_rows(db: sqlite3.Connection, *, generated: bool) -> Iterator[_StepRow]:
+    try:
+        cursor = db.execute(
             "SELECT idx,step_type,status,metadata,step_payload,has_subtrajectory,step_format "
             "FROM steps ORDER BY idx"
-        ).fetchall()
-        rows: list[_StepRow] = []
-        for expected_index, value in enumerate(sql_rows):
+        )
+        for expected_index, value in enumerate(cursor):
             index, step_type, status, metadata, payload, has_subtrajectory, step_format = value
             if index != expected_index:
                 raise SessionMigrateError("Antigravity step indices are not contiguous")
@@ -970,32 +1128,7 @@ def _validate_database(
             ):
                 raise SessionMigrateError("Antigravity protobuf value exceeds the safety limit")
             _validate_step(payload, step_type=step_type, status=status, generated=generated)
-            rows.append(_StepRow(index, step_type, status, metadata, payload))
-        metadata_losses: Counter[str] = Counter()
-        if trajectory_metadata_loss:
-            metadata_losses["antigravity_incomplete_trajectory_metadata"] += 1
-        if len(trajectory_rows) > 1:
-            metadata_losses["antigravity_auxiliary_trajectory_metadata"] += len(trajectory_rows) - 1
-        for table in (
-            "gen_metadata",
-            "executor_metadata",
-            "parent_references",
-            "battle_mode_infos",
-        ):
-            auxiliary_count = int(db.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-            if generated and auxiliary_count:
-                raise SessionMigrateError("generated Antigravity database has runtime metadata")
-            if auxiliary_count:
-                metadata_losses[f"antigravity_{table}"] += auxiliary_count
-        return (
-            conversation_id,
-            trajectory_id,
-            tuple(rows),
-            started_at,
-            dict(metadata_losses),
-        )
-    except SessionMigrateError:
-        raise
+            yield _StepRow(index, step_type, status, metadata, payload)
     except sqlite3.Error as exc:
         raise SessionMigrateError("Antigravity database schema or rows are invalid") from exc
 
@@ -1034,7 +1167,11 @@ def _validate_trajectory_metadata(
     fields = _decode_message(data)
     root = _optional_text(fields, 6)
     if root is not None and root != conversation_id:
-        raise SessionMigrateError("Antigravity trajectory metadata root ID is inconsistent")
+        # Sub-agent conversations record their root conversation here.
+        raise SessionMigrateError(
+            "Antigravity sub-agent conversations cannot be converted directly; "
+            f"transfer their root conversation {root}"
+        )
     incomplete = root is None
     if generated and incomplete:
         raise SessionMigrateError("generated Antigravity trajectory metadata is incomplete")
@@ -1129,8 +1266,10 @@ def _validate_known_step_payload(
     # the enclosing message here still enforces bounded, valid protobuf wire.
 
 
-def _project_events(rows: Sequence[_StepRow]) -> tuple[Event, ...]:
-    events: list[Event] = []
+def _project_events(
+    rows: Iterable[_StepRow], *, events: list[Event] | None = None
+) -> tuple[Event, ...]:
+    events = [] if events is None else events
     pending: deque[tuple[str, str]] = deque()
     emitted_calls: Counter[str] = Counter()
     known_calls: set[str] = set()

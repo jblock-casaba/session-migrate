@@ -158,7 +158,8 @@ default. Every other source requires an explicit target.
 | `--cwd PATH` | Target working directory; precedence is option, source CWD, process CWD |
 | `--target-cli-version VERSION` | Change emitted metadata only; the writer architecture remains pinned. For Antigravity, `1.1.16` or `1.4.12` selects that pinned build's store layout |
 | `--target-cli PATH` | Pinned OpenCode, Kilo, Antigravity, Cursor, or Hermes executable/source for native import |
-| `--since-last-compaction` | Transfer only the window the source agent would itself resume with |
+| `--since-last-compaction` | Require a compaction to cut at; fail when the session has none |
+| `--full-history` | Transfer the full transcript, including history the source already compacted away |
 | `--model-provider ID` | Codex, Pi, OMP, OpenCode, or Muse target provider |
 | `--model ID` | Target model label for formats that persist one, including Grok, Kilo, and OpenHands |
 | `--home PATH` | Target native home, except OpenCode and Kilo |
@@ -172,46 +173,56 @@ installation still requires the exact pinned version. Antigravity `import` and
 `agy` build is installed (Linux x86_64 1.1.16 or macOS arm64 1.4.12); `convert`
 never runs a target CLI and defaults to the 1.1.16 layout.
 
-### `--since-last-compaction`
+### Compaction window (default), `--since-last-compaction`, `--full-history`
 
-By default a migration replays the whole transcript, including history the source
-agent had already compacted away. That is the faithful record, but a long session
-can exceed the target model's context window several times over, which makes the
-imported session unusable for an actual resume.
+A full transcript replays history the source agent had already compacted away, so
+a long session can exceed the target model's context window several times over
+and cannot actually be resumed. By default `convert`, `import`, and `transfer`
+therefore keep what the source itself carried forward: its last compaction
+summary or replacement history, followed by every later event. Everything before
+that boundary is dropped, and the manifest reports a
+`truncated_to_last_compaction` warning. A session with no compaction transfers
+in full, since that is already its effective window.
 
-`--since-last-compaction` keeps what the source itself carried forward: the
-plaintext messages from its last replacement history, followed by every later
-event. Everything before that boundary is dropped, and the manifest reports a
-`truncated_to_last_compaction` warning with the event counts on each side.
+| Option | Behavior |
+| --- | --- |
+| *(none)* | Cut at the last compaction when there is one; otherwise transfer in full |
+| `--since-last-compaction` | Cut at the last compaction; fail when the session has none |
+| `--full-history` | Never cut; transfer every turn, including compacted history |
+
+Boundaries per source: Claude `compact_boundary` and its `isCompactSummary`
+message; Codex `compacted` records; Copilot successful compactions and context
+clears; Antigravity checkpoints and context clears; and the equivalent records
+of the other readers.
 
 The compaction summary is carried over only when the source recorded it as
-plaintext. Claude writes its summary as a readable `isCompactSummary` message, so
-a truncated Claude migration keeps the summary that frames the remaining turns.
+plaintext. Claude writes its summary as a readable `isCompactSummary` message.
 In every observed Codex rollout the `compacted.message` field is empty and the
 replacement history ends in a provider-encrypted `compaction` item, so there the
 summary survives only as a counted opaque placeholder and the carried anchor
 messages, not the summary, give the resumed session its framing. Antigravity
 checkpoints and Copilot compactions and context clears record plaintext
-summaries and serve as boundaries too.
+summaries.
 
 A Claude target has no portable compaction record, so a transcript that starts
 from a summary replays it as the first user message under the heading
 "Summary of the earlier part of this conversation:", counted as
-`compaction:summary_as_user_message`. Summaries later in a full transcript are
-still omitted because the turns they summarize are present.
+`compaction:summary_as_user_message`. With `--full-history`, summaries inside the
+transcript are omitted because the turns they summarize are present.
 
-The option fails closed when a session has no compaction boundary, because the
-full transcript is already its effective window.
-
-For a Claude source the transcript is not loaded whole. One streaming pass keeps
-a small index (UUIDs, parent links, record types, byte offsets), the active
-branch is found from it, and only the records from its last compaction boundary
-on are read back, including preserved turns stored before the boundary. The
-total-size safety limit applies to that loaded window instead of the file, so a
-transcript far over 256 MiB can still be cut; per-record limits and the index
-pass's own bounds still apply. The truncation warning's
-`events_before_boundary` then counts only events inside the loaded window.
-Other sources still load the whole session before cutting it.
+Claude, Codex, Copilot, and Antigravity sources are not loaded whole when cutting.
+A streaming pass validates every record and keeps only a small index (and, for
+Codex and Copilot, the few values earlier history contributes to later records,
+such as tool names and the model); then only the window is read back. The
+total-size safety limit (256 MiB, or 256 MiB of steps for Antigravity) applies
+to that window instead of the file, so a session far over the limit can still be
+cut; per-record limits and the index pass's own bounds still apply. Antigravity
+streams every step from an on-disk snapshot and keeps events only from the
+latest compaction on. The result is identical to loading the whole session and
+cutting it. Because history before the window is never loaded, the warning
+reports it as `records_skipped_before_window`, and `events_before_boundary` counts
+only events inside the window. With `--full-history`, or for a session without a
+compaction, the whole session is loaded and the ordinary limits apply to it.
 
 ## Home resolution
 

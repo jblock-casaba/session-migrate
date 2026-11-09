@@ -2209,3 +2209,39 @@ def test_reread_window_is_bounded_like_one_file(tmp_path: Path) -> None:
     assert [record.value for record in reread_jsonl(path, located[1:])] == [{"n": 1}, {"n": 2}]
     with pytest.raises(JsonlError, match="window exceeds"):
         reread_jsonl(path, located, max_total_bytes=located[0].byte_length)
+
+
+def test_codex_window_load_matches_a_full_parse_across_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, continuation = codex_continued_thread(tmp_path)
+    records = [json.loads(line) for line in continuation.read_text().splitlines()]
+    compacted = paginated_record(
+        4,
+        "compacted",
+        {"message": "", "replacement_history": [records[1]["payload"]]},
+    )
+    for record in records[1:]:
+        record["ordinal"] += 1
+    write_jsonl(continuation, [records[0], compacted, *records[1:]])
+    reread: list[object] = []
+    original = codex.reread_jsonl
+
+    def recording(source: Path, locations: object, **limits: int) -> list[object]:
+        loaded = original(source, locations, **limits)  # type: ignore[arg-type]
+        reread.extend(record.value.get("ordinal") for record in loaded)
+        return loaded
+
+    def signature(session: Session) -> list[tuple[object, ...]]:
+        return [
+            (event.kind, event.role, event.text, event.payload.get("source_record_type"))
+            for event in conversion.truncate_to_last_compaction(session)[0].events
+        ]
+
+    full = signature(codex.parse(continuation))
+    monkeypatch.setattr(codex, "reread_jsonl", recording)
+    window = codex.parse(continuation, since_last_compaction=True)
+
+    assert signature(window) == full
+    assert reread == [0, 4, 5, 6]
+    assert window.records_before_window == 3

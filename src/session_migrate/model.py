@@ -104,6 +104,8 @@ class Session:
     events: tuple[Event, ...]
     raw_record_count: int
     model_provider: str | None = None
+    # Source records a window loader skipped because they precede its last compaction.
+    records_before_window: int = 0
 
     def event_counts(self) -> dict[str, int]:
         return dict(sorted(Counter(event.kind.value for event in self.events).items()))

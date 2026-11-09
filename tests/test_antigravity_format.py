@@ -858,3 +858,48 @@ def test_only_cleared_steps_may_lose_their_payload(tmp_path: Path) -> None:
 
     with pytest.raises(SessionMigrateError, match="step oneof payload is missing"):
         antigravity.parse_session(path)
+
+
+def test_antigravity_window_load_matches_a_full_parse_cut_at_the_same_compaction(
+    tmp_path: Path,
+) -> None:
+    from session_migrate.conversion import truncate_to_last_compaction
+    from session_migrate.errors import NoCompactionBoundaryError
+
+    cleared = antigravity.STEP_STATUS_CLEARED
+    path = cleared_conversation(tmp_path, {3: (cleared, None)})
+
+    def signature(session: Session) -> list[tuple[object, ...]]:
+        return [
+            (event.kind, event.role, event.text, event.tool_call_id, event.payload.get("reason"))
+            for event in truncate_to_last_compaction(session)[0].events
+        ]
+
+    window = antigravity.parse_session(path, since_last_compaction=True)
+
+    assert signature(window) == signature(antigravity.parse_session(path))
+    assert window.records_before_window == 4
+
+    plain = tmp_path / "plain" / f"{TARGET_ID}.db"
+    plain.parent.mkdir()
+    plain.write_bytes(serialized(tmp_path))
+    with pytest.raises(NoCompactionBoundaryError):
+        antigravity.parse_session(plain, since_last_compaction=True)
+
+
+def test_sub_agent_conversation_points_to_its_root(tmp_path: Path) -> None:
+    root = "55555555-5555-4555-8555-555555555555"
+    path = tmp_path / f"{TARGET_ID}.db"
+    path.write_bytes(serialized(tmp_path))
+    with sqlite3.connect(path) as db:
+        blob = db.execute("SELECT data FROM trajectory_metadata_blob").fetchone()[0]
+        rebuilt = b"".join(
+            antigravity._field_text(6, root)
+            if field.number == 6
+            else antigravity._field_bytes(field.number, field.value)
+            for field in antigravity._decode_message(blob)
+        )
+        db.execute("UPDATE trajectory_metadata_blob SET data=?", (rebuilt,))
+
+    with pytest.raises(SessionMigrateError, match=f"sub-agent conversations.*{root}"):
+        antigravity.parse_session(path)

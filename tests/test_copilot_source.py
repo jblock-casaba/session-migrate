@@ -670,3 +670,59 @@ def test_copilot_out_of_order_timestamp_keeps_file_order_and_holds_clock(
         if event.payload.get("reason") == "copilot_timestamp_out_of_order"
     ] == [11]
     assert artifact.native_bytes
+
+
+@pytest.mark.parametrize("boundary", ["fixture", "between_call_and_result"])
+def test_copilot_window_load_matches_a_full_parse_cut_at_the_same_compaction(
+    tmp_path: Path, boundary: str
+) -> None:
+    records = fixture_records()
+    if boundary == "between_call_and_result":
+        compaction = {
+            "type": "session.compaction_complete",
+            "data": {"success": True, "summaryContent": "SYNTHETIC_EARLY_SUMMARY"},
+            "id": str(uuid.uuid4()),
+            "parentId": records[8]["id"],
+            "timestamp": records[8]["timestamp"],
+        }
+        records[9]["parentId"] = compaction["id"]
+        records.insert(9, compaction)
+        # Disable the fixture's later compaction so the window starts at this one.
+        records[13]["data"]["success"] = False
+    path = tmp_path / "events.jsonl"
+    write_records(path, records)
+
+    def signature(session: object) -> list[tuple[object, ...]]:
+        return [
+            (
+                event.kind,
+                event.role,
+                event.text,
+                event.tool_call_id,
+                event.tool_name,
+                event.timestamp,
+            )
+            for event in truncate_to_last_compaction(session)[0].events  # type: ignore[arg-type]
+        ]
+
+    full = signature(copilot.parse_session(path))
+    window = copilot.parse_session(path, since_last_compaction=True)
+
+    assert signature(window) == full
+    assert window.records_before_window > 0
+    if boundary == "between_call_and_result":
+        assert ("view", "call_copilot_source_probe") in {
+            (event.tool_name, event.tool_call_id)
+            for event in window.events
+            if event.kind == EventKind.TOOL_RESULT
+        }
+
+
+def test_copilot_window_load_still_validates_the_whole_log(tmp_path: Path) -> None:
+    records = fixture_records()
+    records[3]["parentId"] = str(uuid.uuid4())
+    path = tmp_path / "events.jsonl"
+    write_records(path, records)
+
+    with pytest.raises(SessionMigrateError, match="parent chain"):
+        copilot.parse_session(path, since_last_compaction=True)

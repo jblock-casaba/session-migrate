@@ -46,10 +46,10 @@ from session_migrate.conversion import (
     write_artifact,
 )
 from session_migrate.discovery import locate_session, normalized_source_id
-from session_migrate.errors import SessionMigrateError
+from session_migrate.errors import NoCompactionBoundaryError, SessionMigrateError
 from session_migrate.formats import antigravity
 from session_migrate.inspection import inspect_session
-from session_migrate.model import AgentFormat, TargetFormat
+from session_migrate.model import AgentFormat, Session, TargetFormat
 
 _SHARED_DATABASE_SOURCES = {
     AgentFormat.HERMES,
@@ -115,11 +115,12 @@ examples:
     session-migrate catalog search <keyword>
     session-migrate transfer --title "<exact session title>" --to claude
 
-  Long sessions. A full transcript routinely exceeds the target model's
-  context window; this keeps only the window the source agent would itself
-  resume with (post-compaction history plus everything after it):
+  Long sessions. Every migration keeps only the window the source agent would
+  itself resume with (its last compaction summary or carried history plus
+  everything after it), since a full transcript routinely exceeds the target
+  model's context window. To transfer every turn anyway:
 
-    session-migrate transfer --from codex --to claude --since-last-compaction <session-id>
+    session-migrate transfer --from codex --to claude --full-history <session-id>
 
 native session locations
   Used to resolve --from (source) and --to (target). Override with --source-home
@@ -627,11 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                     else:
                         assert source_path is not None
-                        session = load_session(
-                            source_path,
-                            source_format,
-                            since_last_compaction=args.since_last_compaction,
-                        )
+                        session = _load_history(source_path, source_format, args)
                 if not session.session_id:
                     raise SessionMigrateError(
                         "discovered transcript has no native session ID metadata"
@@ -654,10 +651,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             else:
                 source_format = AgentFormat(args.format) if args.format else None
-                session = load_session(
-                    _resolve_source(args.path, source_format),
-                    source_format,
-                    since_last_compaction=args.since_last_compaction,
+                session = _load_history(
+                    _resolve_source(args.path, source_format), source_format, args
                 )
                 target_format = TargetFormat(args.to)
             if target_format == TargetFormat.OPENCODE and getattr(args, "home", None):
@@ -680,13 +675,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "and transfer, or Hermes import and transfer"
                 )
             truncation: dict[str, int] = {}
-            if args.since_last_compaction:
+            if not args.full_history:
                 session, truncation = truncate_to_last_compaction(session)
-                if not truncation:
-                    raise SessionMigrateError(
-                        "--since-last-compaction found no compaction boundary in this "
-                        "session; the full transcript is already its effective window"
-                    )
+                if not truncation and args.since_last_compaction:
+                    raise NoCompactionBoundaryError
             target_cli_version = args.target_cli_version
             if (
                 target_format == TargetFormat.ANTIGRAVITY
@@ -896,13 +888,21 @@ def _add_conversion_arguments(
             "(otherwise resolve the pinned CLI from its normal location/PATH)"
         ),
     )
-    parser.add_argument(
+    history = parser.add_mutually_exclusive_group()
+    history.add_argument(
         "--since-last-compaction",
         action="store_true",
         help=(
-            "transfer only the window the source agent would itself resume with: the "
-            "plaintext history carried across its last compaction, plus every later "
-            "event (a full transcript often exceeds the target model's context window)"
+            "require a compaction to cut at (the default cuts at the last one when "
+            "present and otherwise transfers the full transcript)"
+        ),
+    )
+    history.add_argument(
+        "--full-history",
+        action="store_true",
+        help=(
+            "transfer the full transcript, including history the source agent already "
+            "compacted away (often exceeds the target model's context window)"
         ),
     )
     parser.add_argument(
@@ -942,6 +942,21 @@ _ID_LOOKUP_FORMATS: tuple[AgentFormat, ...] = (
     AgentFormat.GROK,
     AgentFormat.OPENHANDS,
 )
+
+
+def _load_history(
+    path: Path, source_format: AgentFormat | None, args: argparse.Namespace
+) -> Session:
+    """Load a session, reading only its last-compaction window unless --full-history."""
+
+    if args.full_history:
+        return load_session(path, source_format)
+    try:
+        return load_session(path, source_format, since_last_compaction=True)
+    except NoCompactionBoundaryError:
+        if args.since_last_compaction:
+            raise
+        return load_session(path, source_format)
 
 
 def _resolve_source(value: Path, source_format: AgentFormat | None) -> Path:

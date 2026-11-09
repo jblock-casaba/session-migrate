@@ -7,8 +7,9 @@ import pytest
 from session_migrate import __version__
 from session_migrate import cli as cli_module
 from session_migrate.cli import build_parser, main
-from session_migrate.formats import opencode
+from session_migrate.formats import codex, opencode
 from session_migrate.formats.claude import project_directory_name
+from session_migrate.model import EventKind
 
 
 def test_parser_exposes_version() -> None:
@@ -809,12 +810,129 @@ def test_since_last_compaction_flag_trims_and_reports(tmp_path: Path, capsys: ob
     warning = next(
         item for item in result["warnings"] if item["code"] == "truncated_to_last_compaction"
     )
-    assert warning["events_before_boundary"] > 0
+    # Records before the last compaction are never loaded, only counted.
+    assert warning["records_skipped_before_window"] > 0
     assert warning["events_carried_forward"] == 1
 
     written = (tmp_path / "trimmed.jsonl").read_text()
     assert "carried goal" in written
     assert "after compaction" in written
+
+
+def compacted_codex_source(tmp_path: Path) -> Path:
+    fixture = Path(__file__).parent / "fixtures" / "codex-0.144.4" / "basic.jsonl"
+    records = [json.loads(line) for line in fixture.read_text().splitlines() if line.strip()]
+    records += [
+        {
+            "timestamp": "2026-08-17T13:30:00Z",
+            "type": "compacted",
+            "payload": {
+                "message": "",
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "carried goal"}],
+                    }
+                ],
+            },
+        },
+        {
+            "timestamp": "2026-08-17T13:31:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "after compaction"}],
+            },
+        },
+    ]
+    source = tmp_path / "compacted.jsonl"
+    source.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    return source
+
+
+@pytest.mark.parametrize(("flags", "cut"), [([], True), (["--full-history"], False)])
+def test_default_cuts_at_the_last_compaction_unless_full_history(
+    tmp_path: Path, capsys: object, flags: list[str], cut: bool
+) -> None:
+    source = compacted_codex_source(tmp_path)
+    before = codex.parse(source).events
+    earliest = next(event.text for event in before if event.kind == EventKind.MESSAGE)
+    output = tmp_path / "out.jsonl"
+
+    status = main(
+        ["convert", str(source), "--to", "copilot", "--output", str(output), "--cwd", str(tmp_path)]
+        + flags
+    )
+
+    assert status == 0
+    result = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    codes = {item["code"] for item in result["warnings"]}
+    written = output.read_text()
+    assert ("truncated_to_last_compaction" in codes) is cut
+    assert (earliest in written) is not cut
+    assert "after compaction" in written
+
+
+def test_default_transfers_a_session_without_compaction_in_full(
+    tmp_path: Path, capsys: object
+) -> None:
+    source = tmp_path / "plain.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "timestamp": "2026-08-17T13:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "20000000-0000-4000-8000-000000000000",
+                        "cwd": str(tmp_path),
+                        "cli_version": "0.144.4",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-17T13:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "only turn"}],
+                    },
+                },
+            )
+        )
+        + "\n"
+    )
+    output = tmp_path / "out.jsonl"
+
+    status = main(
+        ["convert", str(source), "--to", "copilot", "--output", str(output), "--cwd", str(tmp_path)]
+    )
+
+    assert status == 0
+    result = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    assert "truncated_to_last_compaction" not in {item["code"] for item in result["warnings"]}
+    assert "only turn" in output.read_text()
+
+
+def test_history_flags_are_mutually_exclusive(tmp_path: Path) -> None:
+    source = compacted_codex_source(tmp_path)
+    with pytest.raises(SystemExit) as exited:
+        main(
+            [
+                "convert",
+                str(source),
+                "--to",
+                "copilot",
+                "--output",
+                str(tmp_path / "out.jsonl"),
+                "--since-last-compaction",
+                "--full-history",
+            ]
+        )
+    assert exited.value.code == 2
 
 
 def test_since_last_compaction_fails_when_there_is_no_boundary(

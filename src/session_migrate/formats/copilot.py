@@ -22,19 +22,28 @@ import json
 import re
 import uuid
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from session_migrate.errors import SessionMigrateError
+from session_migrate.errors import NoCompactionBoundaryError, SessionMigrateError
 from session_migrate.formats.common import (
     object_value,
     portable_data_image,
     string,
     valid_rfc3339,
 )
-from session_migrate.jsonl import encode_jsonl, file_sha256, iter_jsonl
+from session_migrate.jsonl import (
+    SCAN_MAX_RECORDS,
+    SCAN_MAX_TOTAL_BYTES,
+    JsonlError,
+    JsonlRecord,
+    encode_jsonl,
+    file_sha256,
+    iter_jsonl,
+    reread_jsonl,
+)
 from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Role, Session
 
 PINNED_COPILOT_VERSION = "1.0.70"
@@ -186,6 +195,45 @@ class ParsedCopilotSession:
     title: str | None
     events: tuple[Event, ...]
     raw_record_count: int
+    records_before_window: int = 0
+
+
+@dataclass(slots=True)
+class _ProjectionState:
+    """Values the projection carries from earlier records into later ones."""
+
+    model: str | None = None
+    title: str | None = None
+    emitted_calls: Counter[str] = field(default_factory=Counter)
+    task_completions: set[str] = field(default_factory=set)
+    tool_names: dict[str, str] = field(default_factory=dict)
+    latest: tuple[datetime, str] | None = None
+
+    def replay(self, value: dict[str, Any]) -> None:
+        """Apply an index record's effect on later records, as the projection does."""
+
+        timestamp = value["timestamp"]
+        moment = _parse_timestamp(valid_rfc3339(timestamp) or timestamp)
+        if self.latest is None or moment >= self.latest[0]:
+            self.latest = (moment, timestamp)
+        if string(value.get("agentId")):
+            return
+        record_type = value["type"]
+        if record_type == "assistant.message":
+            for call_id, tool_name, completes in value["requests"]:
+                self.emitted_calls[call_id] += 1
+                self.tool_names[call_id] = tool_name
+                if completes:
+                    self.task_completions.add(call_id)
+        elif record_type == "tool.execution_start":
+            call_id, tool_name = value["start"]
+            self.tool_names[call_id] = tool_name
+            if self.emitted_calls[call_id]:
+                self.emitted_calls[call_id] -= 1
+        elif record_type == "session.model_change":
+            self.model = value["model"] or self.model
+        elif record_type == "session.title_changed":
+            self.title = value["title"] or self.title
 
 
 def serialize(
@@ -527,20 +575,130 @@ def serialize(
     return encode_jsonl(records), dict(sorted(dropped.items()))
 
 
-def parse(path: Path) -> ParsedCopilotSession:
-    """Parse a native Copilot event log into the portable projection."""
+def parse(path: Path, *, since_last_compaction: bool = False) -> ParsedCopilotSession:
+    """Parse a native Copilot event log into the portable projection.
 
+    ``since_last_compaction`` validates the whole log while streaming it into a slim
+    index and projects only the records from its last compaction on, so the log's
+    total size does not matter.
+    """
+
+    if since_last_compaction:
+        return _parse_window(path)
     records = [dict(item.value) for item in iter_jsonl(path)]
     _validate_source_records(records, path=path)
     first_data = records[0]["data"]
-    assets = _asset_inventory(records)
+    return _project(
+        path,
+        first_data,
+        list(enumerate(records)),
+        _asset_inventory(records),
+        _ProjectionState(model=string(first_data.get("selectedModel"))),
+        raw_record_count=len(records),
+    )
+
+
+def _parse_window(path: Path) -> ParsedCopilotSession:
+    validator = _SourceValidator(path)
+    index: list[JsonlRecord] = []
+    for item in iter_jsonl(
+        path, max_total_bytes=SCAN_MAX_TOTAL_BYTES, max_records=SCAN_MAX_RECORDS
+    ):
+        record = dict(item.value)
+        validator.add(record)
+        index.append(replace(item, value=_index_value(record)))
+    validator.finish([dict(entry.value) for entry in index])
+    boundaries = [
+        position
+        for position, entry in enumerate(index)
+        if entry.value.get("boundary") and not string(entry.value.get("agentId"))
+    ]
+    if not boundaries:
+        raise NoCompactionBoundaryError
+    start = boundaries[-1]
+    first_data = index[0].value["data"]
+    state = _ProjectionState(model=string(first_data.get("selectedModel")))
+    for entry in index[:start]:
+        state.replay(dict(entry.value))
+    window = reread_jsonl(path, index[start:])
+    if any(
+        full.value.get("id") != located.value.get("id")
+        for full, located in zip(window, index[start:], strict=True)
+    ):
+        raise JsonlError("session file changed while reading; retry after it is idle")
+    referenced = {asset_id for item in window for asset_id in _asset_references(dict(item.value))}
+    earlier_assets = reread_jsonl(
+        path,
+        [
+            entry
+            for entry in index[:start]
+            if entry.value.get("type") == "session.binary_asset"
+            and entry.value["asset"] in referenced
+        ],
+    )
+    records = [dict(item.value) for item in (*earlier_assets, *window)]
+    return _project(
+        path,
+        first_data,
+        [(item.index, dict(item.value)) for item in window],
+        _asset_inventory(records),
+        state,
+        raw_record_count=len(index),
+        records_before_window=start,
+    )
+
+
+def _index_value(record: dict[str, Any]) -> dict[str, Any]:
+    """Keep what chain checks, window selection, and the projection state need."""
+
+    value = {key: record.get(key) for key in ("type", "id", "parentId", "agentId", "timestamp")}
+    data = record["data"]
+    record_type = record["type"]
+    if record_type == "session.start":
+        value["data"] = data
+    elif record_type == "assistant.message":
+        value["requests"] = [
+            (
+                request["toolCallId"],
+                request["name"],
+                request["name"] == "task_complete"
+                and bool(string(object_value(request.get("arguments")).get("summary"))),
+            )
+            for request in data.get("toolRequests") or []
+        ]
+    elif record_type == "tool.execution_start":
+        value["start"] = (data["toolCallId"], data["toolName"])
+    elif record_type == "session.model_change":
+        value["model"] = string(data.get("newModel"))
+    elif record_type == "session.title_changed":
+        value["title"] = string(data.get("title"))
+    elif record_type == "session.binary_asset":
+        value["asset"] = data["assetId"]
+    elif record_type == "session.compaction_complete":
+        value["boundary"] = data.get("success") is True and bool(string(data.get("summaryContent")))
+    elif record_type == "session.context_cleared":
+        value["boundary"] = True
+    return value
+
+
+def _project(
+    path: Path,
+    first_data: dict[str, Any],
+    entries: list[tuple[int, dict[str, Any]]],
+    assets: dict[str, tuple[str, str, int]],
+    state: _ProjectionState,
+    *,
+    raw_record_count: int,
+    records_before_window: int = 0,
+) -> ParsedCopilotSession:
     events: list[Event] = []
     referenced_assets: set[str] = set()
-    emitted_calls: Counter[str] = Counter()
-    task_completions: set[str] = set()
-    tool_names: dict[str, str] = {}
-    model = string(first_data.get("selectedModel"))
-    title: str | None = None
+    emitted_calls = state.emitted_calls
+    task_completions = state.task_completions
+    tool_names = state.tool_names
+    model = state.model
+    title = state.title
+    ids = {index: string(record.get("id")) for index, record in entries}
 
     def opaque(index: int, record_type: str, reason: str, timestamp: str | None) -> None:
         events.append(
@@ -548,12 +706,12 @@ def parse(path: Path) -> ParsedCopilotSession:
                 kind=EventKind.OPAQUE,
                 timestamp=timestamp,
                 payload={"reason": reason, "source_event_type": record_type},
-                provenance=Provenance(index, record_type, string(records[index].get("id"))),
+                provenance=Provenance(index, record_type, ids[index]),
             )
         )
 
-    latest: tuple[datetime, str] | None = None
-    for index, record in enumerate(records):
+    latest = state.latest
+    for index, record in entries:
         record_type = record["type"]
         data = record["data"]
         timestamp = record["timestamp"]
@@ -777,7 +935,7 @@ def parse(path: Path) -> ParsedCopilotSession:
         elif record_type != "session.start":
             opaque(index, record_type, "copilot_native_lifecycle_or_ui_event", timestamp)
 
-    for index, record in enumerate(records):
+    for index, record in entries:
         if record["type"] == "session.binary_asset":
             asset_id = record["data"]["assetId"]
             if asset_id not in referenced_assets:
@@ -798,18 +956,19 @@ def parse(path: Path) -> ParsedCopilotSession:
         model=model,
         title=title,
         events=tuple(events),
-        raw_record_count=len(records),
+        raw_record_count=raw_record_count,
+        records_before_window=records_before_window,
     )
 
 
-def parse_session(path: Path) -> Session:
+def parse_session(path: Path, *, since_last_compaction: bool = False) -> Session:
     """Parse Copilot's canonical ``events.jsonl`` as a first-class source."""
 
-    parsed = parse(path)
+    parsed = parse(path, since_last_compaction=since_last_compaction)
     return Session(
         source_format=AgentFormat.COPILOT,
         source_path=path.resolve(),
-        source_sha256=file_sha256(path),
+        source_sha256=file_sha256(path, max_total_bytes=SCAN_MAX_TOTAL_BYTES),
         session_id=parsed.session_id,
         cwd=parsed.cwd,
         started_at=parsed.started_at,
@@ -819,6 +978,7 @@ def parse_session(path: Path) -> Session:
         events=parsed.events,
         raw_record_count=parsed.raw_record_count,
         model_provider="github-copilot",
+        records_before_window=parsed.records_before_window,
     )
 
 
@@ -886,9 +1046,98 @@ def _decode_native_records(data: bytes) -> list[dict[str, Any]]:
 def _validate_source_records(records: list[dict[str, Any]], *, path: Path) -> None:
     """Validate supported version-1 source envelopes and projected payloads."""
 
-    if not records or records[0].get("type") != "session.start":
+    validator = _SourceValidator(path)
+    for record in records:
+        validator.add(record)
+    validator.finish(records)
+
+
+class _SourceValidator:
+    """Validate source records one at a time.
+
+    Envelope and payload checks run as each full record arrives. ``finish`` runs the
+    checks spanning records (one ``session.start``, mainline ancestry, and asset
+    references), which need only identity fields, so a log can be validated while
+    it is streamed.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.count = 0
+        self.start_count = 0
+        self.seen_ids: set[str] = set()
+        self.assets: dict[str, tuple[str, int]] = {}
+        self.references: list[tuple[str, Any, Any]] = []
+
+    def add(self, record: dict[str, Any]) -> None:
+        index = self.count
+        self.count += 1
+        if index == 0:
+            _validate_session_start(record, self.path)
+        _ensure_json_bounds(record)
+        record_type = string(record.get("type"))
+        if record_type not in _KNOWN_SOURCE_TYPES and not (
+            record_type and _SOURCE_EVENT_NAME.fullmatch(record_type)
+        ):
+            raise SessionMigrateError("Copilot event type is invalid")
+        if record_type == "session.start":
+            self.start_count += 1
+            if index != 0:
+                raise SessionMigrateError("Copilot session contains multiple session.start events")
+        if record.get("ephemeral") is True:
+            raise SessionMigrateError("Copilot persisted session contains an ephemeral event")
+        agent_id = record.get("agentId")
+        if agent_id is not None and not string(agent_id):
+            raise SessionMigrateError("Copilot event agentId is invalid")
+        event_id = string(record.get("id"))
+        if not event_id or not _is_uuid4(event_id) or event_id in self.seen_ids:
+            raise SessionMigrateError("Copilot event IDs must be unique UUIDv4 values")
+        self.seen_ids.add(event_id)
+        parent_id = record.get("parentId")
+        if parent_id is not None and (not isinstance(parent_id, str) or not _is_uuid4(parent_id)):
+            raise SessionMigrateError("Copilot event parent chain contains an invalid ID")
+        if not valid_rfc3339(record.get("timestamp")):
+            raise SessionMigrateError("Copilot event timestamp is invalid")
+        data = record.get("data")
+        if not isinstance(data, dict):
+            raise SessionMigrateError("Copilot event data must be an object")
+        _validate_source_payload(record_type, data)
+        if record_type == "session.binary_asset":
+            asset_id, mime_type, _, byte_length = _validated_asset(data)
+            if asset_id in self.assets:
+                raise SessionMigrateError("Copilot binary asset ID is duplicated")
+            self.assets[asset_id] = (mime_type, byte_length)
+        for reference in _asset_reference_items(record):
+            asset_id = string(reference.get("assetId"))
+            if asset_id:
+                self.references.append(
+                    (asset_id, reference.get("mimeType"), reference.get("byteLength"))
+                )
+
+    def finish(self, records: list[dict[str, Any]]) -> None:
+        if self.count == 0:
+            raise SessionMigrateError("Copilot session must begin with session.start")
+        if self.start_count != 1:
+            raise SessionMigrateError("Copilot session must contain one session.start event")
+        _validate_source_parent_chains(records)
+        for asset_id, reference_mime, reference_length in self.references:
+            stored = self.assets.get(asset_id)
+            if stored is None:
+                raise SessionMigrateError("Copilot binary reference has no matching asset")
+            mime_type, byte_length = stored
+            if (
+                reference_mime is not None
+                and reference_mime != mime_type
+                or reference_length is not None
+                and reference_length != byte_length
+            ):
+                raise SessionMigrateError("Copilot binary reference metadata does not match asset")
+
+
+def _validate_session_start(record: dict[str, Any], path: Path) -> None:
+    if record.get("type") != "session.start":
         raise SessionMigrateError("Copilot session must begin with session.start")
-    first_data = records[0].get("data")
+    first_data = record.get("data")
     if not isinstance(first_data, dict):
         raise SessionMigrateError("Copilot session.start data is invalid")
     session_id = string(first_data.get("sessionId"))
@@ -911,41 +1160,39 @@ def _validate_source_records(records: list[dict[str, Any]], *, path: Path) -> No
         if not cwd or "\0" in cwd:
             raise SessionMigrateError("Copilot working directory context is invalid")
 
-    seen_ids: set[str] = set()
-    start_count = 0
-    for index, record in enumerate(records):
-        _ensure_json_bounds(record)
-        record_type = string(record.get("type"))
-        if record_type not in _KNOWN_SOURCE_TYPES and not (
-            record_type and _SOURCE_EVENT_NAME.fullmatch(record_type)
-        ):
-            raise SessionMigrateError("Copilot event type is invalid")
-        if record_type == "session.start":
-            start_count += 1
-            if index != 0:
-                raise SessionMigrateError("Copilot session contains multiple session.start events")
-        if record.get("ephemeral") is True:
-            raise SessionMigrateError("Copilot persisted session contains an ephemeral event")
-        agent_id = record.get("agentId")
-        if agent_id is not None and not string(agent_id):
-            raise SessionMigrateError("Copilot event agentId is invalid")
-        event_id = string(record.get("id"))
-        if not event_id or not _is_uuid4(event_id) or event_id in seen_ids:
-            raise SessionMigrateError("Copilot event IDs must be unique UUIDv4 values")
-        seen_ids.add(event_id)
-        parent_id = record.get("parentId")
-        if parent_id is not None and (not isinstance(parent_id, str) or not _is_uuid4(parent_id)):
-            raise SessionMigrateError("Copilot event parent chain contains an invalid ID")
-        if not valid_rfc3339(record.get("timestamp")):
-            raise SessionMigrateError("Copilot event timestamp is invalid")
-        data = record.get("data")
-        if not isinstance(data, dict):
-            raise SessionMigrateError("Copilot event data must be an object")
-        _validate_source_payload(record_type, data)
-    if start_count != 1:
-        raise SessionMigrateError("Copilot session must contain one session.start event")
-    _validate_source_parent_chains(records)
-    _validate_source_references(records)
+
+def _asset_reference_items(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the attachment and tool-result entries that may name a binary asset."""
+
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return []
+    if record.get("type") == "user.message":
+        return list(data.get("attachments") or [])
+    if record.get("type") != "tool.execution_complete":
+        return []
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return []
+    binary = result.get("binaryResultsForLlm", [])
+    if not isinstance(binary, list) or len(binary) > 10_000:
+        raise SessionMigrateError("Copilot binary results must be a bounded array")
+    if any(not isinstance(item, dict) for item in binary):
+        raise SessionMigrateError("Copilot binary result is invalid")
+    for item in binary:
+        if string(item.get("data")):
+            _validate_inline_binary(item, "tool binary result")
+        elif not string(item.get("assetId")) and not string(item.get("omittedReason")):
+            raise SessionMigrateError("Copilot binary result has no data")
+    return binary
+
+
+def _asset_references(record: dict[str, Any]) -> set[str]:
+    return {
+        asset_id
+        for item in _asset_reference_items(record)
+        if (asset_id := string(item.get("assetId")))
+    }
 
 
 def _outside_mainline(record_type: str) -> bool:
@@ -1093,55 +1340,6 @@ def _validate_source_payload(record_type: str, data: dict[str, Any]) -> None:
             "developer",
         }:
             raise SessionMigrateError("Copilot system message is invalid")
-
-
-def _validate_source_references(records: list[dict[str, Any]]) -> None:
-    assets: dict[str, tuple[str, str, int]] = {}
-    for record in records:
-        if record["type"] != "session.binary_asset":
-            continue
-        data = record["data"]
-        asset_id, mime_type, encoded, byte_length = _validated_asset(data)
-        if asset_id in assets:
-            raise SessionMigrateError("Copilot binary asset ID is duplicated")
-        assets[asset_id] = (mime_type, encoded, byte_length)
-
-    for record in records:
-        data = record["data"]
-        references: list[dict[str, Any]] = []
-        if record["type"] == "user.message":
-            references.extend(data.get("attachments") or [])
-        elif record["type"] == "tool.execution_complete":
-            result = data.get("result")
-            if isinstance(result, dict):
-                binary = result.get("binaryResultsForLlm", [])
-                if not isinstance(binary, list) or len(binary) > 10_000:
-                    raise SessionMigrateError("Copilot binary results must be a bounded array")
-                if any(not isinstance(item, dict) for item in binary):
-                    raise SessionMigrateError("Copilot binary result is invalid")
-                for item in binary:
-                    if string(item.get("data")):
-                        _validate_inline_binary(item, "tool binary result")
-                    elif not string(item.get("assetId")) and not string(item.get("omittedReason")):
-                        raise SessionMigrateError("Copilot binary result has no data")
-                references.extend(binary)
-        for reference in references:
-            asset_id = string(reference.get("assetId"))
-            if not asset_id:
-                continue
-            stored = assets.get(asset_id)
-            if stored is None:
-                raise SessionMigrateError("Copilot binary reference has no matching asset")
-            mime_type, _, byte_length = stored
-            reference_mime = reference.get("mimeType")
-            reference_length = reference.get("byteLength")
-            if (
-                reference_mime is not None
-                and reference_mime != mime_type
-                or reference_length is not None
-                and reference_length != byte_length
-            ):
-                raise SessionMigrateError("Copilot binary reference metadata does not match asset")
 
 
 def _validated_asset(data: dict[str, Any]) -> tuple[str, str, str, int]:

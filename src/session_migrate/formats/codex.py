@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
 import uuid
 from collections import Counter, deque
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from session_migrate.errors import SessionMigrateError
+from session_migrate.errors import NoCompactionBoundaryError, SessionMigrateError
 from session_migrate.formats.common import content_text, object_value, string, valid_rfc3339
-from session_migrate.jsonl import JsonlRecord, encode_jsonl, file_sha256, iter_jsonl
+from session_migrate.jsonl import (
+    SCAN_MAX_RECORDS,
+    SCAN_MAX_TOTAL_BYTES,
+    JsonlError,
+    JsonlRecord,
+    encode_jsonl,
+    file_sha256,
+    iter_jsonl,
+    reread_jsonl,
+)
 from session_migrate.model import AgentFormat, Event, EventKind, Provenance, Role, Session
 
 PINNED_CODEX_VERSION = "0.144.4"
@@ -51,12 +61,138 @@ AGENTS_INSTRUCTIONS_PREFIX = "# AGENTS.md instructions for "
 _IMAGE_ATTACHMENT_PREFIX = re.compile(r"\A(?:\s*<image\b[^>]*>\s*(?:</image>\s*)?)+", re.IGNORECASE)
 
 
-def parse(path: Path) -> Session:
+def parse(path: Path, *, since_last_compaction: bool = False) -> Session:
+    """Parse a rollout thread, including earlier segments a continuation names.
+
+    ``since_last_compaction`` loads only the records from the thread's last
+    ``compacted`` record on. The thread is scanned once for an index and for the
+    values earlier history contributes, so its total size does not matter.
+    """
+
+    if since_last_compaction:
+        return _parse_window(path)
     records = thread_records(path)
-    history_mode = _canonical_history_mode(records)
-    if history_mode == "paginated":
+    if _canonical_history_mode(records) == "paginated":
         _validate_paginated_ordinals(records)
-    genuine_user_texts = _ui_user_texts(records)
+    return _parse_records(path, records, genuine_user_texts=_ui_user_texts(records))
+
+
+def _parse_window(path: Path) -> Session:
+    texts: set[str] = set()
+    model: str | None = None
+    title: str | None = None
+
+    def note(record: JsonlRecord) -> None:
+        nonlocal model, title
+        texts.update(_ui_user_texts([record]))
+        value = record.value
+        record_type = string(value.get("type"))
+        payload = object_value(value.get("payload"))
+        event_type = string(payload.get("type")) if record_type == "event_msg" else None
+        if record_type == "turn_context" or event_type == "task_started":
+            model = model or string(payload.get("model"))
+        elif event_type == "thread_name_updated":
+            title = string(payload.get("thread_name")) or string(payload.get("name")) or title
+
+    index = _thread_index(path, frozenset(), note, None)
+    located = [record for _, record in index]
+    if _canonical_history_mode(located) == "paginated":
+        _validate_paginated_ordinals(located)
+    compactions = [
+        position
+        for position, record in enumerate(located)
+        if string(record.value.get("type")) == "compacted"
+    ]
+    if not compactions:
+        raise NoCompactionBoundaryError
+    start = compactions[-1]
+    meta = next(
+        (
+            position
+            for position, record in enumerate(located[:start])
+            if string(record.value.get("type")) == "session_meta"
+        ),
+        None,
+    )
+    chosen = ([index[meta]] if meta is not None else []) + index[start:]
+    window: list[JsonlRecord] = []
+    for source, group in itertools.groupby(chosen, key=lambda item: item[0]):
+        window += reread_jsonl(source, [record for _, record in group])
+    if any(
+        string(full.value.get("type")) != string(slim.value.get("type"))
+        or full.value.get("ordinal") != slim.value.get("ordinal")
+        for full, (_, slim) in zip(window, chosen, strict=True)
+    ):
+        raise JsonlError("session file changed while reading; retry after it is idle")
+    return _parse_records(
+        path,
+        window,
+        genuine_user_texts=frozenset(texts),
+        model=model,
+        title=title,
+        raw_record_count=len(index),
+        records_before_window=start - (1 if meta is not None else 0),
+    )
+
+
+def _thread_index(
+    path: Path,
+    seen: frozenset[Path],
+    note: Callable[[JsonlRecord], None],
+    before: int | None,
+) -> list[tuple[Path, JsonlRecord]]:
+    """Stream a thread's segments into a slim, located index (see ``thread_records``).
+
+    ``before`` keeps only records whose ordinal precedes a continuation's cut.
+    """
+
+    resolved = path.resolve()
+    if resolved in seen or len(seen) >= MAX_HISTORY_SEGMENTS:
+        raise SessionMigrateError("Codex history_base chain is cyclic or too long")
+    stream: Iterator[JsonlRecord] = iter_jsonl(
+        path, max_total_bytes=SCAN_MAX_TOTAL_BYTES, max_records=SCAN_MAX_RECORDS
+    )
+    first = next(stream, None)
+    if first is None:
+        return []
+    index: list[tuple[Path, JsonlRecord]] = []
+    base = _history_base([first])
+    if base is not None:
+        thread_id, end_ordinal, end_offset = base
+        base_path = _find_history_base(path, thread_id, end_ordinal, end_offset)
+        index = _thread_index(
+            base_path,
+            seen | {resolved},
+            note,
+            end_ordinal if before is None else min(end_ordinal, before),
+        )
+        if not index or index[-1][1].value.get("ordinal") != end_ordinal - 1:
+            raise SessionMigrateError("Codex history_base does not end at its declared ordinal")
+        if first.value.get("ordinal") != end_ordinal:
+            raise SessionMigrateError("Codex continuation does not start at its history_base")
+    offset = len(index)
+    for record in itertools.chain([first], stream):
+        ordinal = record.value.get("ordinal")
+        if before is not None and not (isinstance(ordinal, int) and ordinal < before):
+            continue
+        note(record)
+        slim: dict[str, Any] = {"type": record.value.get("type"), "ordinal": ordinal}
+        if string(record.value.get("type")) == "session_meta":
+            slim["payload"] = record.value.get("payload")
+        index.append((path, replace(record, index=offset + record.index, value=slim)))
+    return index
+
+
+def _parse_records(
+    path: Path,
+    records: Sequence[JsonlRecord],
+    *,
+    genuine_user_texts: frozenset[str],
+    model: str | None = None,
+    title: str | None = None,
+    raw_record_count: int | None = None,
+    records_before_window: int = 0,
+) -> Session:
     events: list[Event] = []
     fallback_events: list[Event] = []
     context_compacted_events: list[Event] = []
@@ -64,11 +200,9 @@ def parse(path: Path) -> Session:
     cwd = None
     started_at = None
     cli_version = None
-    model = None
     model_provider = None
     response_message_count = 0
     response_messages: Counter[tuple[Role | None, str]] = Counter()
-    title = None
 
     for record in records:
         value = record.value
@@ -281,7 +415,7 @@ def parse(path: Path) -> Session:
     return Session(
         source_format=AgentFormat.CODEX,
         source_path=path.resolve(),
-        source_sha256=file_sha256(path),
+        source_sha256=file_sha256(path, max_total_bytes=SCAN_MAX_TOTAL_BYTES),
         session_id=session_id,
         cwd=cwd,
         started_at=started_at,
@@ -289,8 +423,9 @@ def parse(path: Path) -> Session:
         model=model,
         title=title,
         events=tuple(events),
-        raw_record_count=len(records),
+        raw_record_count=len(records) if raw_record_count is None else raw_record_count,
         model_provider=model_provider,
+        records_before_window=records_before_window,
     )
 
 

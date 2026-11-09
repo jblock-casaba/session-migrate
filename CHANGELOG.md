@@ -6,6 +6,23 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Cut at the last compaction by default. `convert`, `import`, and `transfer` now
+  keep the source's last compaction summary or carried history plus every later
+  event, because a full transcript routinely exceeds a 1M-token context window.
+  A session without a compaction still transfers in full. `--full-history`
+  restores the previous behavior; `--since-last-compaction` now means requiring
+  a compaction and failing without one.
+- Read only the compaction window of Codex, Copilot, and Antigravity sources too,
+  so their total size no longer matters when cutting. Each streams the whole
+  session once to validate it and build a small index (Codex follows
+  continuation segments; Copilot replays the tool-call, model, title, and clock
+  state earlier records carry into later ones; Antigravity streams steps from an
+  on-disk snapshot), then loads only the window under the ordinary limits. On
+  every compacted session checked the result is identical to a full parse cut at
+  the same boundary. The truncation warning reports skipped history as
+  `records_skipped_before_window`.
+- Name the root conversation when refusing an Antigravity sub-agent conversation,
+  instead of reporting `trajectory metadata root ID is inconsistent`.
 - Cut a Claude transcript of any size with `--since-last-compaction`. The file
   was loaded whole before being cut, so one over the 256 MiB safety limit
   failed even though only its tail was needed. A streaming pass now indexes the
