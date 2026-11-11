@@ -13,11 +13,12 @@ to exact executables:
 | Picker index | `~/.gemini/antigravity-cli/conversation_summaries.db` | same, two more columns |
 | Title | picker index | `~/.gemini/antigravity-cli/annotations/<uuid>.pbtxt` |
 
-This is deliberately not a claim of compatibility with other Antigravity
-versions or platforms. Automatic installation checks the executable version,
-byte size, and digest before it touches the native store, and writes the store
-layout of the build it found. The sections below describe 1.1.16; 1.4.12
-differences are listed in [their own section](#antigravity-1412-macos-arm64).
+Automatic installation checks the executable's version, byte size, and digest
+before it touches the native store, and writes the store layout of the pinned
+build it found. Any other build is accepted only after
+[its store is checked](#untested-builds) to still have the 1.4.12 layout. The
+sections below describe 1.1.16; 1.4.12 differences are listed in
+[their own section](#antigravity-1412-macos-arm64).
 
 The independently observed schema notes and synthetic standard-library fixture
 generator are published in the unofficial
@@ -274,9 +275,45 @@ real `~/.gemini/antigravity-cli` was never written.
    three; the database kept one trajectory and its metadata, and the picker
    kept the title, workspace, and project.
 
+## Untested builds
+
+`agy` updates itself every few days, so pinning the executable alone would refuse
+every new release. `import` and `transfer` accept a build that is not pinned
+when its own store shows it still uses the 1.4.12 layout, and then write that
+layout:
+
+1. The picker index has the 1.4.12 columns and `user_version` 3.
+2. A root conversation the build wrote since it was installed (modified after
+   the executable's modification time, not one `session-migrate` imported) is
+   checked: the newest one up to 64 MiB, else the newest of any size.
+3. Its picker row has the source, project, and app values the writer uses, and a
+   `CASCADE_RUN_STATUS_*` status (an active conversation is `RUNNING`).
+4. Its database has the `user_version`, trajectory metadata fields, and step
+   types that the writer emits for a one-turn probe conversation.
+5. The reader parses it with user and assistant turns. A conversation over
+   64 MiB is read from its last compaction, which still validates every step,
+   and needs only one readable turn.
+
+Any difference stops the import and names it. If the build has not written a
+conversation since it was installed, hold a short `agy` conversation and retry.
+The transfer result carries an `untested_target_build` warning, and the manifest
+records the receiving build under `target.installed_cli` with the conversation
+checked. The check is evidence, not proof: an `agy` process started before an
+update may still be writing the conversation it reads.
+
+Validated on 2026-11-11 against `agy` 1.5.5 in an isolated `HOME`, set up as for
+1.4.12 below. `agy -p` wrote a native conversation; the store check passed against
+it; `session-migrate transfer --from claude --to antigravity` installed a cut
+synthetic transcript whose summary, prompt, and tool result each carried a
+marker. `agy --conversation <id> -p ...` resumed it and, without tools, replied
+with all three markers and not the one before the cut. The same check passes on
+a live 1.5.5 store.
+
 ## Known boundaries
 
-- The format is version-private. A different executable hash fails closed.
+- The format is version-private. A build that is not pinned is accepted only
+  through the store check above, which reads what that build wrote rather than
+  proving it loads what this tool writes.
 - Generic tool transport is TUI-render proven. Built-in tool payloads are read
   conservatively, but only synthetic generic-tool execution was available for
   native visual validation.

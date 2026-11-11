@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import stat
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -592,7 +593,7 @@ def test_install_refuses_a_picker_index_of_another_build(
     assert not (target_home / "annotations").exists()
 
 
-def test_binary_gate_names_every_pinned_build_and_reports_none_installed(
+def test_binary_gate_names_every_pinned_build(
     tmp_path: Path,
 ) -> None:
     executable = tmp_path / "agy"
@@ -603,7 +604,6 @@ def test_binary_gate_names_every_pinned_build_and_reports_none_installed(
         antigravity.verify_pinned_cli(executable)
     with pytest.raises(SessionMigrateError, match="installed agy is a different build"):
         antigravity.verify_pinned_cli(executable, version="1.4.12")
-    assert antigravity.installed_pinned_version(executable) is None
 
 
 def native_generic_step(
@@ -925,3 +925,166 @@ def test_native_tool_argument_may_be_empty(tmp_path: Path) -> None:
     session = antigravity.parse_session(path)
 
     assert tool_results(session.events) == [("agy-call-1", None, True)]
+
+
+NATIVE_ID = "55555555-5555-4555-8555-555555555555"
+
+
+def untested_agy(tmp_path: Path, version: str = "1.5.4") -> Path:
+    """An agy that is not a pinned build, installed an hour ago."""
+
+    executable = tmp_path / "bin" / "agy"
+    executable.parent.mkdir()
+    executable.write_text(f"#!/bin/sh\necho {version}\n")
+    os.chmod(executable, 0o700)
+    installed = time.time() - 3600
+    os.utime(executable, (installed, installed))
+    return executable
+
+
+def agy_store(tmp_path: Path) -> Path:
+    """A 1.4.12-layout store holding one conversation agy wrote since it was installed."""
+
+    home = tmp_path / "antigravity-cli"
+    home.mkdir(mode=0o700)
+    columns = antigravity._SUMMARY_COLUMNS_1412
+    row = antigravity._summary_values(
+        session_id=NATIVE_ID,
+        title="Native",
+        preview="AGY_USER_ALPHA",
+        step_count=2,
+        timestamp="2026-11-10T12:00:00Z",
+        cwd=tmp_path,
+        last_user_input_index=0,
+        cli_version=antigravity.ANTIGRAVITY_1412_VERSION,
+    )
+    with sqlite3.connect(home / "conversation_summaries.db") as db:
+        db.executescript(AGY_1412_SUMMARY_DDL)
+        db.execute(
+            f"INSERT INTO conversation_summaries({','.join(columns)}) "
+            f"VALUES ({','.join('?' * len(columns))})",
+            row,
+        )
+    data, _ = antigravity.serialize(
+        portable_session(tmp_path),
+        session_id=NATIVE_ID,
+        trajectory_id=TRAJECTORY_ID,
+        cwd=tmp_path,
+        cli_version=antigravity.ANTIGRAVITY_1412_VERSION,
+        timestamp="2026-11-10T12:00:00Z",
+    )
+    path = home / antigravity.session_relative_path(NATIVE_ID)
+    path.parent.mkdir(mode=0o700)
+    path.write_bytes(data)
+    return home
+
+
+@pytest.mark.parametrize("variant", ["idle", "running", "large"])
+def test_untested_build_receives_the_checked_layout_when_its_store_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    executable = untested_agy(tmp_path)
+    home = agy_store(tmp_path)
+    if variant == "running":
+        # An active conversation records its run state, not the idle state written here.
+        with sqlite3.connect(home / "conversation_summaries.db") as db:
+            db.execute("UPDATE conversation_summaries SET status='CASCADE_RUN_STATUS_RUNNING'")
+    elif variant == "large":
+        # Large conversations are read from their last compaction, or whole without one.
+        monkeypatch.setattr(antigravity, "STORE_CHECK_FULL_PARSE_BYTES", 0)
+
+    build = antigravity.resolve_target_build(home, executable)
+    installed = antigravity.install_database(
+        serialized_1412(tmp_path),
+        session_id=TARGET_ID,
+        cwd=tmp_path,
+        timestamp="2026-11-11T12:00:00Z",
+        title="Imported",
+        target_home=home,
+        target_cli=executable,
+        cli_version=antigravity.STORE_CHECKED_LAYOUT,
+    )
+
+    assert build == antigravity.AntigravityTargetBuild(
+        "1.5.4", antigravity.ANTIGRAVITY_1412_VERSION, NATIVE_ID
+    )
+    assert installed.build == build
+    assert installed.annotation_path is not None and installed.annotation_path.exists()
+    with sqlite3.connect(home / "conversation_summaries.db") as db:
+        assert db.execute(
+            "SELECT count(*) FROM conversation_summaries WHERE conversation_id=?", (TARGET_ID,)
+        ).fetchone() == (1,)
+
+
+def test_untested_build_never_receives_an_older_layout(tmp_path: Path) -> None:
+    with pytest.raises(SessionMigrateError, match="binary mismatch"):
+        antigravity.resolve_target_build(
+            agy_store(tmp_path),
+            untested_agy(tmp_path),
+            layout_version=antigravity.PINNED_ANTIGRAVITY_VERSION,
+        )
+
+
+def _replace_metadata(path: Path, drop: int) -> None:
+    with sqlite3.connect(path) as db:
+        blob = db.execute("SELECT data FROM trajectory_metadata_blob").fetchone()[0]
+        kept = b"".join(
+            antigravity._field_varint(field.number, field.value)
+            if field.wire_type == 0
+            else antigravity._field_bytes(field.number, field.value)
+            for field in antigravity._decode_message(blob)
+            if field.number != drop
+        )
+        db.execute("UPDATE trajectory_metadata_blob SET data=?", (kept,))
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("written before install", "has not written a conversation since it was installed"),
+        ("imported", "has not written a conversation since it was installed"),
+        ("index columns", "columns"),
+        ("index version", "conversation index has a different version"),
+        ("index values", "index values the converter does not write"),
+        ("database version", "have version 2, not 1"),
+        ("metadata", r"lacks fields \[7\]"),
+        ("unreadable", "cannot be read"),
+    ],
+)
+def test_untested_build_is_refused_when_its_store_differs(
+    tmp_path: Path, change: str, message: str
+) -> None:
+    executable = untested_agy(tmp_path)
+    home = agy_store(tmp_path)
+    conversation = home / antigravity.session_relative_path(NATIVE_ID)
+    summaries = home / "conversation_summaries.db"
+    if change == "written before install":
+        written = executable.stat().st_mtime - 60
+        os.utime(conversation, (written, written))
+    elif change == "imported":
+        manifests = home / "session-migrate" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / f"{NATIVE_ID}.json").write_text("{}")
+    elif change == "index columns":
+        with sqlite3.connect(summaries) as db:
+            db.execute("ALTER TABLE conversation_summaries DROP COLUMN group_id")
+    elif change == "index version":
+        with sqlite3.connect(summaries) as db:
+            db.execute("PRAGMA user_version=4")
+    elif change == "index values":
+        with sqlite3.connect(summaries) as db:
+            db.execute("UPDATE conversation_summaries SET project_id='another-project'")
+    elif change == "database version":
+        with sqlite3.connect(conversation) as db:
+            db.execute("PRAGMA user_version=2")
+    elif change == "metadata":
+        _replace_metadata(conversation, drop=7)
+    elif change == "unreadable":
+        with sqlite3.connect(conversation) as db:
+            db.execute("UPDATE steps SET step_payload=x'ff' WHERE idx=0")
+
+    with pytest.raises(SessionMigrateError, match="is not a tested build") as raised:
+        antigravity.resolve_target_build(home, executable)
+
+    assert raised.match(message)
+    assert "1.5.4" in str(raised.value)

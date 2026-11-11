@@ -2348,3 +2348,113 @@ def test_cut_window_without_a_user_turn_gets_its_summary_as_one(tmp_path: Path) 
         (Role.ASSISTANT, "Continuing with the tests."),
     ]
     assert artifact.dropped["compaction:summary_as_user_message"] == 1
+
+
+def _antigravity_messages(tmp_path: Path, events: tuple) -> tuple[list, dict]:
+    from session_migrate.formats import antigravity
+
+    session = Session(
+        source_format=AgentFormat.CLAUDE,
+        source_path=tmp_path / "source.jsonl",
+        source_sha256="0" * 64,
+        session_id=None,
+        cwd=tmp_path,
+        started_at="2026-11-01T00:00:00Z",
+        cli_version=None,
+        model=None,
+        title=None,
+        events=events,
+        raw_record_count=len(events),
+    )
+    artifact = convert_session(
+        session,
+        ConversionOptions(
+            target_format=AgentFormat.ANTIGRAVITY, cwd=tmp_path, target_cli_version="1.4.12"
+        ),
+    )
+    path = tmp_path / f"{artifact.session_id}.db"
+    path.write_bytes(artifact.native_bytes)
+    parsed = antigravity.parse(path)
+    messages = [(e.role, e.text) for e in parsed.events if e.kind == EventKind.MESSAGE]
+    return messages, artifact.dropped
+
+
+def test_antigravity_keeps_the_summary_a_cut_window_starts_with(tmp_path: Path) -> None:
+    """Antigravity stores no compaction, so the summary would otherwise be lost."""
+
+    from session_migrate.model import Event, Provenance
+
+    messages, dropped = _antigravity_messages(
+        tmp_path,
+        (
+            Event(
+                kind=EventKind.COMPACTION,
+                role=Role.SYSTEM,
+                text="Summary: the parser contract is settled.",
+                provenance=Provenance(0, "summary"),
+            ),
+            Event(
+                kind=EventKind.MESSAGE,
+                role=Role.USER,
+                text="Now write the tests.",
+                provenance=Provenance(1, "user"),
+            ),
+            Event(
+                kind=EventKind.MESSAGE,
+                role=Role.ASSISTANT,
+                text="Writing them.",
+                provenance=Provenance(2, "assistant"),
+            ),
+        ),
+    )
+
+    assert messages == [
+        (
+            Role.USER,
+            f"{claude.COMPACTION_SUMMARY_HEADING}\n\nSummary: the parser contract is settled.",
+        ),
+        (Role.USER, "Now write the tests."),
+        (Role.ASSISTANT, "Writing them."),
+    ]
+    assert dropped["compaction:summary_as_user_message"] == 1
+
+
+def test_full_history_does_not_repeat_a_summary_of_messages_it_keeps(tmp_path: Path) -> None:
+    from session_migrate.model import Event, Provenance
+
+    messages, dropped = _antigravity_messages(
+        tmp_path,
+        (
+            Event(
+                kind=EventKind.MESSAGE,
+                role=Role.USER,
+                text="Settle the parser contract.",
+                provenance=Provenance(0, "user"),
+            ),
+            Event(
+                kind=EventKind.MESSAGE,
+                role=Role.ASSISTANT,
+                text="Settled.",
+                provenance=Provenance(1, "assistant"),
+            ),
+            Event(
+                kind=EventKind.COMPACTION,
+                role=Role.SYSTEM,
+                text="Summary: the parser contract is settled.",
+                provenance=Provenance(2, "summary"),
+            ),
+            Event(
+                kind=EventKind.MESSAGE,
+                role=Role.USER,
+                text="Now write the tests.",
+                provenance=Provenance(3, "user"),
+            ),
+        ),
+    )
+
+    assert [text for _, text in messages] == [
+        "Settle the parser contract.",
+        "Settled.",
+        "Now write the tests.",
+    ]
+    assert "compaction:summary_as_user_message" not in dropped

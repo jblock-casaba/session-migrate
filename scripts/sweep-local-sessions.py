@@ -51,6 +51,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path.home())
     parser.add_argument("--full-history", action="store_true", help="do not cut at compactions")
+    parser.add_argument(
+        "--source",
+        action="append",
+        choices=[source.value for source in SOURCES],
+        help="sweep only this source format (repeatable; default: all)",
+    )
     args = parser.parse_args()
 
     cwd = Path(tempfile.gettempdir())
@@ -58,6 +64,8 @@ def main() -> int:
     failures: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
     started = time.monotonic()
     for source_format, pattern in SOURCES.items():
+        if args.source and source_format.value not in args.source:
+            continue
         paths = sorted(args.home.glob(pattern))
         for path in paths:
             name = path.parent.name if path.name == "events.jsonl" else path.name

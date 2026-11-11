@@ -6,6 +6,14 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Accept an Antigravity build that is not pinned when its own store still has
+  the 1.4.12 layout, instead of refusing every `agy` release after 1.4.12. The
+  check reads the picker index and a conversation that build wrote, and names
+  any difference. The result warns `untested_target_build`, and the manifest
+  records the receiving build. Validated end to end with `agy` 1.5.5.
+- Carry the compaction summary into Antigravity and Cursor, which have nowhere
+  to store one, as the first user message of a cut window. Antigravity
+  transfers previously lost it.
 - Hold only Copilot conversation records to the linear main chain. Newer
   releases attach usage records and instruction updates as siblings of the
   assistant reply, which failed as `main event parent chain is not linear`.

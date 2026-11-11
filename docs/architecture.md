@@ -166,9 +166,10 @@ silently changed. The source is never overwritten.
 - OpenCode and Kilo reserve a private external manifest, invoke only the
   official pinned importer, confirm the ID through official read/export
   operations, then finalize the manifest.
-- Antigravity and Cursor reserve the manifest, verify the exact pinned binary,
-  invoke their clean-room atomic database installers, validate the installed
-  session, then finalize the manifest.
+- Antigravity and Cursor reserve the manifest, verify the exact pinned binary
+  (or, for Antigravity, check an untested build's own store against the 1.4.12
+  layout), invoke their clean-room atomic database installers, validate the
+  installed session, then finalize the manifest.
 - Hermes reserves the manifest and invokes the pinned official
   `SessionDB.import_sessions` transaction. MastraCode and Devin validate and
   merge a single native identity into their shared database transactionally.

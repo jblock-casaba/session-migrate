@@ -318,18 +318,21 @@ def truncate_to_last_compaction(session: Session) -> tuple[Session, dict[str, in
     return replace(session, events=kept), stats
 
 
-def _ensure_user_turn(session: Session, target_format: TargetFormat) -> tuple[Session, int]:
-    """Give a cut window with no user prompt one, from its compaction summary.
+# Writers with no place for a compaction summary, where a cut window would lose it.
+_SUMMARY_DROPPING_TARGETS = frozenset({TargetFormat.ANTIGRAVITY, TargetFormat.CURSOR})
 
-    A session cut at its last compaction can continue with assistant work only, and
-    most targets refuse a history without a user turn. The Claude writer replays a
-    leading summary itself.
+
+def _replay_summary(session: Session, target_format: TargetFormat) -> tuple[Session, int]:
+    """Carry a cut window's compaction summary as a user message where it would be lost.
+
+    A window cut at the last compaction starts with its summary. Antigravity and Cursor
+    cannot store one, and a window can also hold no user prompt at all, which most
+    targets refuse. In either case the summary becomes the first user message, as the
+    Claude writer does itself. A full history keeps the messages the summary covers, so
+    a summary that follows them is not replayed for storage alone.
     """
 
-    if target_format == TargetFormat.CLAUDE or any(
-        event.kind == EventKind.MESSAGE and event.role == Role.USER and event.text
-        for event in session.events
-    ):
+    if target_format == TargetFormat.CLAUDE:
         return session, 0
     position = next(
         (
@@ -340,6 +343,13 @@ def _ensure_user_turn(session: Session, target_format: TargetFormat) -> tuple[Se
         None,
     )
     if position is None:
+        return session, 0
+    has_user_turn = any(
+        event.kind == EventKind.MESSAGE and event.role == Role.USER and event.text
+        for event in session.events
+    )
+    leads_window = not any(event.kind == EventKind.MESSAGE for event in session.events[:position])
+    if has_user_turn and not (leads_window and target_format in _SUMMARY_DROPPING_TARGETS):
         return session, 0
     summary = session.events[position]
     replay = Event(
@@ -355,7 +365,7 @@ def _ensure_user_turn(session: Session, target_format: TargetFormat) -> tuple[Se
 
 def convert_session(session: Session, options: ConversionOptions) -> ConversionArtifact:
     target_format = TargetFormat(options.target_format.value)
-    session, replayed_summary = _ensure_user_turn(session, target_format)
+    session, replayed_summary = _replay_summary(session, target_format)
     same_format_rewrite = session.source_format.value == target_format.value
     portable_id = _validated_uuid(options.session_id) if options.session_id else str(uuid.uuid4())
     target_cwd = (options.cwd or session.cwd or Path.cwd()).resolve()
@@ -995,9 +1005,7 @@ def install_antigravity_artifact(
             raise SessionMigrateError("Antigravity installer resolved an unexpected target path")
         return native_path, manifest_path
 
-    manifest_bytes = (
-        json.dumps(artifact.manifest(output_path=native_path), indent=2, sort_keys=True) + "\n"
-    ).encode()
+    manifest = artifact.manifest(output_path=native_path)
     reservation_identity: tuple[int, int] | None = None
     reservation_guard: int | None = None
     install_succeeded = False
@@ -1018,11 +1026,17 @@ def install_antigravity_artifact(
         install_succeeded = True
         if installed.conversation_path != native_path:
             raise SessionMigrateError("Antigravity installer resolved an unexpected target path")
+        if installed.build is not None:
+            # The layout version names what was written; this names who receives it.
+            manifest["target"]["installed_cli"] = {
+                "version": installed.build.version,
+                "checked_conversation": installed.build.checked_conversation,
+            }
         _write_reserved_file(
             reservation_guard,
             manifest_path,
             reservation_identity,
-            manifest_bytes,
+            (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
         )
     except BaseException as exc:
         if reservation_identity is not None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -76,6 +77,13 @@ PINNED_ANTIGRAVITY_BUILDS = (
     ),
 )
 SUPPORTED_ANTIGRAVITY_VERSIONS = frozenset(build.version for build in PINNED_ANTIGRAVITY_BUILDS)
+# An untested agy build is accepted when its own store still has this layout.
+STORE_CHECKED_LAYOUT = ANTIGRAVITY_1412_VERSION
+# The store check reads conversations up to this size whole, and larger ones from
+# their last compaction (which still validates every step); smaller ones go first.
+STORE_CHECK_FULL_PARSE_BYTES = 64 * 1024 * 1024
+# The picker index version 1.4.12 creates.
+_SUMMARY_USER_VERSION_1412 = 3
 
 MAX_NATIVE_BYTES = 256 * 1024 * 1024
 MAX_STEPS = 100_000
@@ -253,6 +261,20 @@ class _WindowEvents(list[Event]):
         super().append(event)
 
 
+class UnpinnedAntigravityBuildError(SessionMigrateError):
+    """The installed agy is not one of the exact tested builds."""
+
+
+@dataclass(frozen=True, slots=True)
+class AntigravityTargetBuild:
+    """The agy build an import is for, and the store layout it receives."""
+
+    version: str
+    layout_version: str
+    # The native conversation the store check read; None for an exact tested build.
+    checked_conversation: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class InstalledAntigravitySession:
     """Paths written by :func:`install_database`."""
@@ -260,6 +282,7 @@ class InstalledAntigravitySession:
     conversation_path: Path
     summaries_path: Path
     annotation_path: Path | None = None
+    build: AntigravityTargetBuild | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,24 +655,235 @@ def verify_pinned_cli(
     return _verify_pinned_build(executable, environ=environ, version=version)[0]
 
 
-def installed_pinned_version(
-    executable: Path | None = None, *, environ: Mapping[str, str] | None = None
-) -> str | None:
-    """Return the version of the installed pinned build, or None when it is not one."""
-
-    try:
-        return _verify_pinned_build(executable, environ=environ, version=None)[1].version
-    except SessionMigrateError:
-        return None
-
-
-def _verify_pinned_build(
-    executable: Path | None,
+def resolve_target_build(
+    target_home: Path,
+    executable: Path | None = None,
     *,
-    environ: Mapping[str, str] | None,
-    version: str | None,
-) -> tuple[Path, PinnedAntigravityBuild]:
+    environ: Mapping[str, str] | None = None,
+    layout_version: str | None = None,
+) -> AntigravityTargetBuild:
+    """Establish the store layout an import into ``target_home`` must be written in.
+
+    An exact tested build takes its own layout. Any other build takes
+    ``STORE_CHECKED_LAYOUT``, once its store is shown to still have that layout (see
+    :func:`_check_store`); agy updates itself every few days, so pinning the binary
+    alone would refuse every new release. ``layout_version`` accepts only that layout.
+    """
+
+    if layout_version is not None and layout_version not in SUPPORTED_ANTIGRAVITY_VERSIONS:
+        raise SessionMigrateError(f"Antigravity {layout_version} is not a pinned install target")
+    try:
+        if layout_version is None:
+            version = _verify_pinned_build(executable, environ=environ, version=None)[1].version
+        else:
+            verify_pinned_cli(executable, environ=environ, version=layout_version)
+            version = layout_version
+        return AntigravityTargetBuild(version, version)
+    except UnpinnedAntigravityBuildError:
+        if layout_version not in (None, STORE_CHECKED_LAYOUT):
+            raise
     values = dict(os.environ if environ is None else environ)
+    path, info = _resolve_executable(executable, values)
+    version = _query_version(path, values)
+    root = _absolute_no_follow(target_home)
+    key = (str(root), str(path), info.st_size, info.st_mtime_ns, version)
+    if key not in _STORE_CHECKS:
+        _STORE_CHECKS[key] = _check_store(root, version=version, installed_at=info.st_mtime)
+    return AntigravityTargetBuild(version, STORE_CHECKED_LAYOUT, _STORE_CHECKS[key])
+
+
+# Store checks already passed in this process, so a transfer checks once.
+_STORE_CHECKS: dict[tuple[str, str, int, int, str], str] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _ConversationShape:
+    user_version: int
+    metadata_fields: frozenset[int]
+    step_types: frozenset[int]
+
+
+def _conversation_shape(db: sqlite3.Connection) -> _ConversationShape:
+    row = db.execute("SELECT data FROM trajectory_metadata_blob WHERE id='main'").fetchone()
+    metadata = row[0] if row and isinstance(row[0], bytes) else b""
+    return _ConversationShape(
+        user_version=int(db.execute("PRAGMA user_version").fetchone()[0]),
+        metadata_fields=frozenset(field.number for field in _decode_message(metadata)),
+        step_types=frozenset(row[0] for row in db.execute("SELECT DISTINCT step_type FROM steps")),
+    )
+
+
+def _probe_shape() -> _ConversationShape:
+    """The shape of what the writer produces for one user and one assistant turn."""
+
+    events = (
+        Event(
+            kind=EventKind.MESSAGE,
+            role=Role.USER,
+            text="probe",
+            provenance=Provenance(0, "probe"),
+        ),
+        Event(
+            kind=EventKind.MESSAGE,
+            role=Role.ASSISTANT,
+            text="probe",
+            provenance=Provenance(1, "probe"),
+        ),
+    )
+    probe = Session(
+        source_format=AgentFormat.ANTIGRAVITY,
+        source_path=Path("probe"),
+        source_sha256="0" * 64,
+        session_id=None,
+        cwd=Path("/"),
+        started_at="2026-01-01T00:00:00Z",
+        cli_version=None,
+        model=None,
+        title=None,
+        events=events,
+        raw_record_count=len(events),
+    )
+    data, _ = serialize(
+        probe,
+        session_id=str(uuid.uuid4()),
+        cwd=Path("/"),
+        cli_version=STORE_CHECKED_LAYOUT,
+        timestamp="2026-01-01T00:00:00Z",
+    )
+    with _database_from_bytes(data) as db:
+        return _conversation_shape(db)
+
+
+def _check_store(root: Path, *, version: str, installed_at: float) -> str:
+    """Check an untested build's store against the layout the writer produces.
+
+    The picker index must have the layout's columns and version. A root conversation
+    modified since the build was installed (not one this tool imported; the newest
+    small one, else the newest) must have a summary row with the writer's fixed
+    values, use every database version, metadata field, and step type the writer
+    emits, and read back with user and assistant turns (any turn, when only its
+    window after the last compaction is read). Returns that conversation's ID.
+    """
+
+    def mismatch(detail: str) -> SessionMigrateError:
+        return SessionMigrateError(
+            f"Antigravity {version} is not a tested build, and its store does not match "
+            f"the {STORE_CHECKED_LAYOUT} layout this converter writes: {detail}"
+        )
+
+    summaries = root / "conversation_summaries.db"
+    try:
+        summaries_mode = summaries.lstat().st_mode
+    except OSError:
+        summaries_mode = 0
+    if not stat.S_ISREG(summaries_mode):
+        raise SessionMigrateError(
+            f"Antigravity {version} is not a tested build, and it has no conversation "
+            "index to check yet; hold a short agy conversation, then retry"
+        )
+    columns = _summary_columns(STORE_CHECKED_LAYOUT)
+    with tempfile.TemporaryDirectory(prefix="session-migrate-antigravity-store-") as directory:
+        snapshot = Path(directory) / "summaries.db"
+        _backup_database(summaries, snapshot)
+        with closing(sqlite3.connect(snapshot)) as db:
+            db.execute("PRAGMA trusted_schema=OFF")
+            try:
+                observed_columns = _validate_summary_schema(db)
+            except SessionMigrateError as exc:
+                raise mismatch(f"conversation index: {exc}") from exc
+            if observed_columns != columns:
+                raise mismatch("the conversation index has different columns")
+            if db.execute("PRAGMA user_version").fetchone()[0] != _SUMMARY_USER_VERSION_1412:
+                raise mismatch("the conversation index has a different version")
+            rows = db.execute(
+                "SELECT conversation_id,status,source,project_id,app_data_dir "
+                "FROM conversation_summaries "
+                "WHERE parent_conversation_id='' AND nesting_depth=0 AND step_count>0"
+            ).fetchall()
+
+    imported = {path.stem for path in (root / "session-migrate" / "manifests").glob("*.json")}
+    candidates = []
+    for conversation_id, *fixed in rows:
+        if not isinstance(conversation_id, str) or conversation_id in imported:
+            continue
+        try:
+            path = root / session_relative_path(conversation_id)
+            info = path.lstat()
+        except (SessionMigrateError, OSError):
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_mtime > installed_at:
+            large = info.st_size > STORE_CHECK_FULL_PARSE_BYTES
+            candidates.append((large, -info.st_mtime, conversation_id, path, tuple(fixed)))
+    if not candidates:
+        raise SessionMigrateError(
+            f"Antigravity {version} is not a tested build, and it has not written a "
+            "conversation since it was installed to check its store against; hold a short "
+            "agy conversation, then retry"
+        )
+    large, _, conversation_id, path, fixed = min(candidates)
+
+    written = dict(
+        zip(
+            columns,
+            _summary_values(
+                session_id=conversation_id,
+                title="",
+                preview="",
+                step_count=1,
+                timestamp="2026-01-01T00:00:00Z",
+                cwd=Path("/"),
+                last_user_input_index=0,
+                cli_version=STORE_CHECKED_LAYOUT,
+            ),
+            strict=True,
+        )
+    )
+    # The status is the run state (an active conversation is RUNNING); the rest is fixed.
+    expected = tuple(written[name] for name in ("source", "project_id", "app_data_dir"))
+    status_family = str(written["status"]).rpartition("_")[0] + "_"
+    if not str(fixed[0]).startswith(status_family) or fixed[1:] != expected:
+        raise mismatch(
+            f"conversation {conversation_id} has index values the converter does not write"
+        )
+
+    probe = _probe_shape()
+    with tempfile.TemporaryDirectory(prefix="session-migrate-antigravity-store-") as directory:
+        snapshot = Path(directory) / "conversation.db"
+        _backup_database(path, snapshot)
+        with closing(sqlite3.connect(snapshot)) as db:
+            db.execute("PRAGMA trusted_schema=OFF")
+            try:
+                native = _conversation_shape(db)
+            except (sqlite3.Error, SessionMigrateError) as exc:
+                raise mismatch(f"conversation {conversation_id} cannot be inspected") from exc
+    if native.user_version != probe.user_version:
+        raise mismatch(
+            f"conversation databases have version {native.user_version}, not {probe.user_version}"
+        )
+    if missing := sorted(probe.metadata_fields - native.metadata_fields):
+        raise mismatch(f"conversation metadata lacks fields {missing} that the converter writes")
+    if missing := sorted(probe.step_types - native.step_types):
+        raise mismatch(f"conversations lack step types {missing} that the converter writes")
+    try:
+        try:
+            parsed = parse(path, since_last_compaction=large)
+        except NoCompactionBoundaryError:
+            parsed, large = parse(path), False
+    except SessionMigrateError as exc:
+        raise mismatch(f"conversation {conversation_id} cannot be read: {exc}") from exc
+    roles = {
+        event.role for event in parsed.events if event.kind == EventKind.MESSAGE and event.text
+    }
+    if not (roles if large else {Role.USER, Role.ASSISTANT} <= roles):
+        raise mismatch(
+            f"conversation {conversation_id} has no user and assistant turns the converter reads"
+        )
+    return conversation_id
+
+
+def _resolve_executable(
+    executable: Path | None, values: Mapping[str, str]
+) -> tuple[Path, os.stat_result]:
     candidate = str(executable) if executable else shutil.which("agy", path=values.get("PATH"))
     if not candidate:
         raise SessionMigrateError("Antigravity CLI executable 'agy' was not found")
@@ -660,24 +894,10 @@ def _verify_pinned_build(
         raise SessionMigrateError("cannot inspect the Antigravity CLI executable") from exc
     if not stat.S_ISREG(info.st_mode):
         raise SessionMigrateError("Antigravity CLI executable is not a regular file")
-    builds = [
-        build for build in PINNED_ANTIGRAVITY_BUILDS if version is None or build.version == version
-    ]
-    build = next((build for build in builds if info.st_size == build.size), None)
-    if build is None:
-        # Name every pinned build: the requested one is only a default when none matched.
-        expected = " or ".join(
-            f"{build.platform} {build.version}" for build in PINNED_ANTIGRAVITY_BUILDS
-        )
-        raise SessionMigrateError(
-            "Antigravity CLI binary mismatch: automatic import requires an exact pinned "
-            f"build ({expected}); the installed agy is a different build"
-        )
-    digest = _stream_sha256(path, maximum=build.size)
-    if digest != build.sha256:
-        raise SessionMigrateError(
-            "Antigravity CLI binary digest mismatch; refusing private-store installation"
-        )
+    return path, info
+
+
+def _query_version(path: Path, values: Mapping[str, str]) -> str:
     safe_env = {
         key: value
         for key, value in values.items()
@@ -697,10 +917,46 @@ def _verify_pinned_build(
     except (OSError, subprocess.SubprocessError) as exc:
         raise SessionMigrateError("cannot query the Antigravity CLI version") from exc
     observed = completed.stdout.strip()
-    if completed.returncode != 0 or observed != build.version:
+    if completed.returncode != 0 or not _VERSION.fullmatch(observed):
         raise SessionMigrateError(
-            "Antigravity CLI version mismatch: expected "
-            f"{build.version}, observed {observed or '<unavailable>'}"
+            f"Antigravity CLI reported no usable version: {observed[:40] or '<unavailable>'}"
+        )
+    return observed
+
+
+_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+
+
+def _verify_pinned_build(
+    executable: Path | None,
+    *,
+    environ: Mapping[str, str] | None,
+    version: str | None,
+) -> tuple[Path, PinnedAntigravityBuild]:
+    values = dict(os.environ if environ is None else environ)
+    path, info = _resolve_executable(executable, values)
+    builds = [
+        build for build in PINNED_ANTIGRAVITY_BUILDS if version is None or build.version == version
+    ]
+    build = next((build for build in builds if info.st_size == build.size), None)
+    if build is None:
+        # Name every pinned build: the requested one is only a default when none matched.
+        expected = " or ".join(
+            f"{build.platform} {build.version}" for build in PINNED_ANTIGRAVITY_BUILDS
+        )
+        raise UnpinnedAntigravityBuildError(
+            "Antigravity CLI binary mismatch: automatic import requires an exact pinned "
+            f"build ({expected}); the installed agy is a different build"
+        )
+    digest = _stream_sha256(path, maximum=build.size)
+    if digest != build.sha256:
+        raise UnpinnedAntigravityBuildError(
+            "Antigravity CLI binary digest mismatch; refusing private-store installation"
+        )
+    observed = _query_version(path, values)
+    if observed != build.version:
+        raise SessionMigrateError(
+            f"Antigravity CLI version mismatch: expected {build.version}, observed {observed}"
         )
     return path, build
 
@@ -726,14 +982,15 @@ def install_database(
     transaction reserves the matching summary ID.  A failed transaction removes
     only the newly created inodes.  The workspace recent-selection cache is not
     touched because it represents active UI state, not transcript truth.
-    ``cli_version`` names the pinned build whose executable and store layout the
-    installation requires; 1.4.12 also keeps the title in an annotation file.
+    ``cli_version`` names the pinned store layout to write; 1.4.12 also keeps the
+    title in an annotation file. The installed agy must be that exact build, or, for
+    the 1.4.12 layout, a build whose store passes :func:`resolve_target_build`.
     """
 
     validate_native_bytes(data, session_id)
-    if cli_version not in SUPPORTED_ANTIGRAVITY_VERSIONS:
-        raise SessionMigrateError(f"Antigravity {cli_version} is not a pinned install target")
-    verify_pinned_cli(target_cli, environ=environ, version=cli_version)
+    build = resolve_target_build(
+        target_home, target_cli, environ=environ, layout_version=cli_version
+    )
     root = _absolute_no_follow(target_home)
     conversation_path = root / session_relative_path(session_id)
     summaries_path = root / "conversation_summaries.db"
@@ -793,7 +1050,9 @@ def install_database(
                 raise SessionMigrateError(
                     "Antigravity conversation ID already exists; refusing to overwrite it"
                 )
-        return InstalledAntigravitySession(conversation_path, summaries_path, annotation_path)
+        return InstalledAntigravitySession(
+            conversation_path, summaries_path, annotation_path, build
+        )
 
     _ensure_private_directory(root)
     _ensure_summary_database(summaries_path, cli_version)
@@ -850,7 +1109,7 @@ def install_database(
             os.close(conversation_guard)
         if summary_guard is not None:
             os.close(summary_guard)
-    return InstalledAntigravitySession(conversation_path, summaries_path, annotation_path)
+    return InstalledAntigravitySession(conversation_path, summaries_path, annotation_path, build)
 
 
 def _build_database(
@@ -2071,7 +2330,7 @@ def _ensure_summary_database(path: Path, cli_version: str = PINNED_ANTIGRAVITY_V
                     )
                 )
                 if cli_version == ANTIGRAVITY_1412_VERSION:
-                    db.execute("PRAGMA user_version=3")
+                    db.execute(f"PRAGMA user_version={_SUMMARY_USER_VERSION_1412}")
                 if db.execute("PRAGMA integrity_check").fetchone() != ("ok",):
                     raise SessionMigrateError("generated Antigravity summary DB failed integrity")
             data = staged.read_bytes()

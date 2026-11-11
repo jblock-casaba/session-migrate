@@ -140,15 +140,21 @@ An OpenCode dry run can initialize ordinary XDG cache/database metadata because
 the official list preflight is not side-effect-free. No imported session or
 migrator artifact is written.
 
-## Antigravity binary mismatch
+## Antigravity untested build
 
-Automatic Antigravity install supports the exact Linux x86_64 `agy 1.1.16` and
-macOS arm64 `agy 1.4.12` builds, identified by size and SHA-256. A metadata
-override cannot bypass the binary version/digest gate. Install a pinned build or
-use `convert` to inspect an artifact without native installation. Other builds,
-including later releases and other platforms of a pinned version, need a new
-observed-schema/native-oracle validation; see
-[Antigravity format](antigravity-format.md#antigravity-1412-macos-arm64).
+Automatic Antigravity install writes the store layout of the exact Linux x86_64
+`agy 1.1.16` or macOS arm64 `agy 1.4.12` build when one is installed. Any other
+build gets the 1.4.12 layout after a check of its own store; see
+[Untested builds](antigravity-format.md#untested-builds).
+
+- `it has not written a conversation since it was installed`: `agy` updated
+  itself after its last conversation. Hold a short `agy` conversation, then
+  retry.
+- `its store does not match the 1.4.12 layout`: that build changed something the
+  writer depends on, named in the message. Importing would risk a conversation
+  `agy` cannot load; the adapter needs updating for that build.
+- `binary mismatch` with `--target-cli-version 1.1.16`: only the exact 1.1.16
+  build receives that layout.
 
 Antigravity source files are:
 

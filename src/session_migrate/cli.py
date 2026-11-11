@@ -680,13 +680,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not truncation and args.since_last_compaction:
                     raise NoCompactionBoundaryError
             target_cli_version = args.target_cli_version
-            if (
-                target_format == TargetFormat.ANTIGRAVITY
-                and args.command != "convert"
-                and not target_cli_version
-            ):
-                # Write the store layout of the pinned build that receives the import.
-                target_cli_version = antigravity.installed_pinned_version(args.target_cli)
+            target_build = None
+            if target_format == TargetFormat.ANTIGRAVITY and args.command != "convert":
+                # Write the store layout the installed agy reads, before converting.
+                target_build = antigravity.resolve_target_build(
+                    args.home or default_target_home(target_format),
+                    args.target_cli,
+                    layout_version=target_cli_version,
+                )
+                target_cli_version = target_build.layout_version
             artifact = convert_session(
                 session,
                 ConversionOptions(
@@ -741,6 +743,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest_path=manifest_path,
                 dry_run=dry_run,
             )
+            if target_build is not None and target_build.checked_conversation:
+                result["warnings"].append(
+                    {
+                        "code": "untested_target_build",
+                        "version": target_build.version,
+                        "layout_version": target_build.layout_version,
+                        "checked_conversation": target_build.checked_conversation,
+                        "message": (
+                            f"Antigravity {target_build.version} is not a tested build; its "
+                            f"store matches the {target_build.layout_version} layout this "
+                            "converter writes"
+                        ),
+                    }
+                )
             if target_format == TargetFormat.OPENCODE and args.command != "convert":
                 install_opencode_artifact(
                     artifact,

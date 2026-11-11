@@ -168,10 +168,12 @@ default. Every other source requires an explicit target.
 An irrelevant target-specific option may be accepted but has no effect. The
 manifest records the target metadata version and warns when it differs from the
 validated writer pin. Automatic OpenCode, Kilo, Antigravity, Cursor, and Hermes
-installation still requires the exact pinned version. Antigravity `import` and
-`transfer` without `--target-cli-version` write the layout of whichever pinned
-`agy` build is installed (Linux x86_64 1.1.16 or macOS arm64 1.4.12); `convert`
-never runs a target CLI and defaults to the 1.1.16 layout.
+installation still requires the exact pinned version, except that Antigravity
+`import` and `transfer` accept another `agy` build after
+[checking its store](antigravity-format.md#untested-builds) and then write the
+1.4.12 layout. With a pinned `agy` installed (Linux x86_64 1.1.16 or macOS arm64
+1.4.12) they write that build's layout. `convert` never runs a target CLI and
+defaults to the 1.1.16 layout.
 
 ### Compaction window (default), `--since-last-compaction`, `--full-history`
 
