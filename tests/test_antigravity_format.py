@@ -903,3 +903,25 @@ def test_sub_agent_conversation_points_to_its_root(tmp_path: Path) -> None:
 
     with pytest.raises(SessionMigrateError, match=f"sub-agent conversations.*{root}"):
         antigravity.parse_session(path)
+
+
+def test_native_tool_argument_may_be_empty(tmp_path: Path) -> None:
+    """A failed command can record its CommandLine argument as an empty string."""
+
+    argument = antigravity._field_text(1, "CommandLine") + antigravity._field_bytes(2, b"")
+    path = native_generic_step(tmp_path, antigravity.STEP_STATUS_ERROR, None, None)
+    with sqlite3.connect(path) as db:
+        index, payload = db.execute(
+            "SELECT idx, step_payload FROM steps WHERE step_type=?",
+            (antigravity.STEP_TYPE_GENERIC,),
+        ).fetchone()
+        rebuilt = (
+            antigravity._field_varint(1, antigravity.STEP_TYPE_GENERIC)
+            + antigravity._field_varint(4, antigravity.STEP_STATUS_ERROR)
+            + antigravity._field_bytes(140, antigravity._field_bytes(1, argument))
+        )
+        db.execute("UPDATE steps SET step_payload=? WHERE idx=?", (rebuilt, index))
+
+    session = antigravity.parse_session(path)
+
+    assert tool_results(session.events) == [("agy-call-1", None, True)]

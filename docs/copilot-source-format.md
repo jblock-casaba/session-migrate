@@ -173,10 +173,14 @@ Other `model.*` names follow the unrecognized-event policy above.
 
 Model traces may have independent roots and links to trace events not persisted
 in the conversation log. Sub-agent events may be appended out of parent order.
-Main-conversation ancestry is checked through skipped trace/sub-agent nodes,
-and sub-agent chains must attach to an existing mainline ancestor without
-cycles. Missing mainline ancestors, mainline forks, invalid parent IDs, and
-out-of-order mainline ancestry still fail closed.
+Only the records that carry conversation (`session.start`, user and assistant
+messages, tool starts and completions, compactions, context clears, and system
+messages) form the main chain. Lifecycle, diagnostic, sub-agent, and unrecognized
+events are passed through when checking it: newer releases attach some of them,
+such as `session.usage_record`, as siblings of the assistant reply under the
+turn start. A conversation record whose nearest conversation ancestor is not the
+previous conversation record (a fork or reorder), a missing conversation
+ancestor, and invalid parent IDs still fail closed.
 
 Concurrent Copilot writers can log an event a few milliseconds earlier than the
 one before it (observed after `subagent.started` and `subagent.completed`). File

@@ -323,7 +323,7 @@ def test_copilot_source_accepts_detached_model_trace_chains(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("invalid_parent", [None, "missing", "cycle", "fork"])
-def test_copilot_source_validates_main_ancestry_across_interleaved_subagent_events(
+def test_copilot_source_tolerates_side_event_ancestry_around_subagents(
     tmp_path: Path, invalid_parent: str | None
 ) -> None:
     records = fixture_records()
@@ -360,15 +360,47 @@ def test_copilot_source_validates_main_ancestry_across_interleaved_subagent_even
     path = tmp_path / "interleaved-subagent.jsonl"
     write_records(path, records)
 
-    if invalid_parent:
-        with pytest.raises(SessionMigrateError, match="parent chain"):
-            copilot.parse_session(path)
-    else:
-        session = copilot.parse_session(path)
-        assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [
-            "SYNTHETIC_COPILOT_SOURCE_USER",
-            "SYNTHETIC_COPILOT_SOURCE_ASSISTANT",
-        ]
+    # Lifecycle and sub-agent events carry no conversation, so their links are not
+    # held to the main chain; newer releases attach some as siblings.
+    session = copilot.parse_session(path)
+    assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [
+        "SYNTHETIC_COPILOT_SOURCE_USER",
+        "SYNTHETIC_COPILOT_SOURCE_ASSISTANT",
+    ]
+
+
+def test_copilot_source_still_rejects_a_fork_among_conversation_records(tmp_path: Path) -> None:
+    records = fixture_records()
+    # The final reply skips the tool call and result it followed.
+    records[11]["parentId"] = records[7]["id"]
+    path = tmp_path / "forked.jsonl"
+    write_records(path, records)
+
+    with pytest.raises(SessionMigrateError, match="parent chain is not linear"):
+        copilot.parse_session(path)
+
+
+def test_copilot_side_events_may_be_siblings_of_the_turn(tmp_path: Path) -> None:
+    """Copilot attaches usage records to the turn start, next to the assistant reply."""
+
+    records = fixture_records()
+    usage = {
+        **records[6],
+        "type": "session.usage_record",
+        "data": {"usage": {"inputTokens": 1}},
+        "id": str(uuid.uuid4()),
+        "parentId": records[6]["id"],
+    }
+    records.insert(7, usage)
+    path = tmp_path / "siblings.jsonl"
+    write_records(path, records)
+
+    session = copilot.parse_session(path)
+
+    assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [
+        "SYNTHETIC_COPILOT_SOURCE_USER",
+        "SYNTHETIC_COPILOT_SOURCE_ASSISTANT",
+    ]
 
 
 def test_new_copilot_source_to_codex_keeps_last_successful_summary_and_later_history(

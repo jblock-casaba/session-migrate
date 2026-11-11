@@ -2292,3 +2292,59 @@ def test_codex_window_load_matches_a_full_parse_across_segments(
     assert signature(window) == full
     assert reread == [0, 4, 5, 6]
     assert window.records_before_window == 3
+
+
+def test_cut_window_without_a_user_turn_gets_its_summary_as_one(tmp_path: Path) -> None:
+    """After a compaction an agent may keep working with no new prompt."""
+
+    from session_migrate.formats import antigravity
+    from session_migrate.model import Event, Provenance
+
+    events = (
+        Event(
+            kind=EventKind.COMPACTION,
+            role=Role.SYSTEM,
+            text="Summary: the parser contract is settled.",
+            provenance=Provenance(0, "summary"),
+        ),
+        Event(
+            kind=EventKind.MESSAGE,
+            role=Role.ASSISTANT,
+            text="Continuing with the tests.",
+            provenance=Provenance(1, "assistant"),
+        ),
+    )
+    session = Session(
+        source_format=AgentFormat.CLAUDE,
+        source_path=tmp_path / "source.jsonl",
+        source_sha256="0" * 64,
+        session_id=None,
+        cwd=tmp_path,
+        started_at="2026-11-01T00:00:00Z",
+        cli_version=None,
+        model=None,
+        title=None,
+        events=events,
+        raw_record_count=2,
+    )
+
+    artifact = convert_session(
+        session,
+        ConversionOptions(
+            target_format=AgentFormat.ANTIGRAVITY, cwd=tmp_path, target_cli_version="1.4.12"
+        ),
+    )
+    path = tmp_path / f"{artifact.session_id}.db"
+    path.write_bytes(artifact.native_bytes)
+    parsed = antigravity.parse(path)
+
+    assert [
+        (event.role, event.text) for event in parsed.events if event.kind == EventKind.MESSAGE
+    ] == [
+        (
+            Role.USER,
+            f"{claude.COMPACTION_SUMMARY_HEADING}\n\nSummary: the parser contract is settled.",
+        ),
+        (Role.ASSISTANT, "Continuing with the tests."),
+    ]
+    assert artifact.dropped["compaction:summary_as_user_message"] == 1

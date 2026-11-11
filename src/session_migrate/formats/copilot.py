@@ -1195,14 +1195,29 @@ def _asset_references(record: dict[str, Any]) -> set[str]:
     }
 
 
+# Events that carry conversation; only these must form the linear main chain.
+_MAINLINE_TYPES = frozenset(
+    {
+        "session.start",
+        "user.message",
+        "assistant.message",
+        "tool.execution_start",
+        "tool.execution_complete",
+        "session.compaction_complete",
+        "session.context_cleared",
+        "system.message",
+    }
+)
+
+
 def _outside_mainline(record_type: str) -> bool:
     """Whether an event may sit off the main chain, which may pass through it.
 
-    Unrecognized events are treated like model traces: their linkage is unknown and
-    they never supply conversation content.
+    Lifecycle, diagnostic, and unrecognized events never supply conversation content,
+    and newer releases attach some as siblings of the turn they describe.
     """
 
-    return record_type in _MODEL_TRACE_SOURCE_TYPES or record_type not in _KNOWN_SOURCE_TYPES
+    return record_type not in _MAINLINE_TYPES
 
 
 def _validate_source_parent_chains(records: list[dict[str, Any]]) -> None:

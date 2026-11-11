@@ -6,6 +6,17 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Hold only Copilot conversation records to the linear main chain. Newer
+  releases attach usage records and instruction updates as siblings of the
+  assistant reply, which failed as `main event parent chain is not linear`.
+- Accept an empty Antigravity tool argument value, which a failed command can
+  record.
+- Give a cut session that has no user prompt after its last compaction its
+  summary as the first user message, for every target but Claude (which already
+  does), instead of failing for lack of a user turn. Counted as
+  `compaction:summary_as_user_message`.
+- Add `scripts/sweep-local-sessions.py`, which converts every local session
+  through common routes and groups the failures, to run after an agent updates.
 - Relink a Claude record whose parent was never written, instead of failing with
   `Claude active graph references a missing parent UUID`: first by Claude Code's
   own five-second timestamp fallback, otherwise to the latest earlier record

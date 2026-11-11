@@ -50,6 +50,7 @@ pytest and Ruff are development dependencies locked by `uv.lock`.
 | `scripts/validate-copilot-native.py` | Exact Copilot cold-resume/provider-replay oracle |
 | `scripts/validate-core-target-native.py` | Real-source Claude/Codex cold-resume oracle in the pinned image |
 | `scripts/validate-antigravity-native.py` | Exact Antigravity native load/append oracle |
+| `scripts/sweep-local-sessions.py` | Converts every local Claude, Codex, Copilot, and Antigravity session through common routes in memory and groups failures; run it after an agent CLI updates |
 | `scripts/validate-opencode-source-corpus.py` | OpenCode export/source matrix and catalog oracle |
 | `scripts/validate-authenticated-pi-tui.py` | Disposable two-step Pi TUI/Codex-OAuth trajectory |
 

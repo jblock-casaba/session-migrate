@@ -46,7 +46,7 @@ from session_migrate.jsonl import (
     file_snapshot,
     write_private_atomic,
 )
-from session_migrate.model import AgentFormat, EventKind, Session, TargetFormat
+from session_migrate.model import AgentFormat, Event, EventKind, Role, Session, TargetFormat
 
 OPENCODE_HOME_UNSUPPORTED = (
     "--home is not supported for OpenCode imports; control OpenCode's normal HOME/XDG "
@@ -318,8 +318,44 @@ def truncate_to_last_compaction(session: Session) -> tuple[Session, dict[str, in
     return replace(session, events=kept), stats
 
 
+def _ensure_user_turn(session: Session, target_format: TargetFormat) -> tuple[Session, int]:
+    """Give a cut window with no user prompt one, from its compaction summary.
+
+    A session cut at its last compaction can continue with assistant work only, and
+    most targets refuse a history without a user turn. The Claude writer replays a
+    leading summary itself.
+    """
+
+    if target_format == TargetFormat.CLAUDE or any(
+        event.kind == EventKind.MESSAGE and event.role == Role.USER and event.text
+        for event in session.events
+    ):
+        return session, 0
+    position = next(
+        (
+            index
+            for index in range(len(session.events) - 1, -1, -1)
+            if session.events[index].kind == EventKind.COMPACTION and session.events[index].text
+        ),
+        None,
+    )
+    if position is None:
+        return session, 0
+    summary = session.events[position]
+    replay = Event(
+        kind=EventKind.MESSAGE,
+        role=Role.USER,
+        text=f"{claude.COMPACTION_SUMMARY_HEADING}\n\n{summary.text}",
+        timestamp=summary.timestamp,
+        provenance=summary.provenance,
+    )
+    events = (*session.events[: position + 1], replay, *session.events[position + 1 :])
+    return replace(session, events=events), 1
+
+
 def convert_session(session: Session, options: ConversionOptions) -> ConversionArtifact:
     target_format = TargetFormat(options.target_format.value)
+    session, replayed_summary = _ensure_user_turn(session, target_format)
     same_format_rewrite = session.source_format.value == target_format.value
     portable_id = _validated_uuid(options.session_id) if options.session_id else str(uuid.uuid4())
     target_cwd = (options.cwd or session.cwd or Path.cwd()).resolve()
@@ -583,6 +619,8 @@ def convert_session(session: Session, options: ConversionOptions) -> ConversionA
     if not native_bytes:
         raise SessionMigrateError("conversion produced no resumable conversation history")
     _validate_native_bytes(native_bytes, target_format, target_id)
+    if replayed_summary:
+        dropped = dict(sorted({**dropped, "compaction:summary_as_user_message": 1}.items()))
     for kind, count in dropped.items():
         message = "target conversion omitted or transformed this source detail"
         if kind == "compaction:replacement_history_expanded":

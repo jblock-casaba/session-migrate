@@ -1246,7 +1246,7 @@ def _validate_known_step_payload(
         for entry in _bytes_values(fields, 1):
             entry_fields = _decode_message(entry)
             _required_text(entry_fields, 1, "generic argument key")
-            _required_text(entry_fields, 2, "generic argument value")
+            _required_text(entry_fields, 2, "generic argument value", allow_empty=not generated)
         # A cancelled or failed native step may lack a result or its text.
         result = (
             _required_bytes(fields, 2, "generic tool result")
