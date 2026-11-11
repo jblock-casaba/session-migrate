@@ -6,6 +6,11 @@ here. Native format compatibility is documented separately in
 
 ## Unreleased
 
+- Relink a Claude record whose parent was never written, instead of failing with
+  `Claude active graph references a missing parent UUID`: first by Claude Code's
+  own five-second timestamp fallback, otherwise to the latest earlier record
+  without children. Repairs are reported as `opaque:claude_parent_link_repaired`.
+- Name every pinned Antigravity build when refusing an unpinned `agy`.
 - Cut at the last compaction by default. `convert`, `import`, and `transfer` now
   keep the source's last compaction summary or carried history plus every later
   event, because a full transcript routinely exceeds a 1M-token context window.

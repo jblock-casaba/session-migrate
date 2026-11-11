@@ -1400,8 +1400,55 @@ def test_rejects_invalid_claude_graphs(tmp_path: Path) -> None:
         tmp_path / "broken-parent.jsonl",
         [claude_record("assistant", "a1", "missing", "answer", cwd=cwd)],
     )
-    with pytest.raises(SessionMigrateError, match="missing parent UUID"):
-        claude.parse(broken_path)
+    repaired = claude.parse(broken_path)
+    assert [event.text for event in repaired.events if event.text] == ["answer"]
+    assert "claude_parent_link_repaired" in {
+        event.payload.get("reason") for event in repaired.events
+    }
+
+
+def test_claude_lost_parent_links_to_the_previous_turn_end(tmp_path: Path) -> None:
+    """A prompt Claude never wrote leaves its reply pointing at a missing UUID."""
+
+    cwd = str(tmp_path)
+    records = [
+        claude_record("user", "u1", None, "first prompt", cwd=cwd),
+        claude_record("assistant", "a1", "u1", "first answer", cwd=cwd),
+        {**claude_record("system", "s1", "a1", "", cwd=cwd), "subtype": "turn_duration"},
+        claude_record("assistant", "a2", "never-written", "second answer", cwd=cwd),
+        {"type": "last-prompt", "leafUuid": "a2"},
+    ]
+    del records[2]["message"]
+    records[3]["timestamp"] = "2026-08-17T13:30:00Z"
+    session = claude.parse(write_jsonl(tmp_path / "lost-parent.jsonl", records))
+
+    assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [
+        "first prompt",
+        "first answer",
+        "second answer",
+    ]
+
+
+def test_claude_lost_parent_prefers_claude_codes_timestamp_rule(tmp_path: Path) -> None:
+    cwd = str(tmp_path)
+    records = [
+        claude_record("user", "u1", None, "first prompt", cwd=cwd),
+        claude_record("assistant", "a1", "u1", "first answer", cwd=cwd),
+        claude_record("assistant", "dead-end", "u1", "abandoned branch", cwd=cwd),
+        claude_record("assistant", "a2", "never-written", "second answer", cwd=cwd),
+        {"type": "last-prompt", "leafUuid": "a2"},
+    ]
+    records[1]["timestamp"] = "2026-08-17T12:00:01Z"
+    records[2]["timestamp"] = "2026-08-17T11:00:00Z"
+    records[3]["timestamp"] = "2026-08-17T12:00:03Z"
+    session = claude.parse(write_jsonl(tmp_path / "timestamp-parent.jsonl", records))
+
+    # a1 was written two seconds before a2; the later-written dead end is older.
+    assert [event.text for event in session.events if event.kind == EventKind.MESSAGE] == [
+        "first prompt",
+        "first answer",
+        "second answer",
+    ]
 
 
 def test_rejects_standalone_claude_sidechain_with_precise_error(tmp_path: Path) -> None:

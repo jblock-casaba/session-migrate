@@ -601,7 +601,7 @@ def test_binary_gate_names_every_pinned_build_and_reports_none_installed(
 
     with pytest.raises(SessionMigrateError, match="Linux x86_64 1.1.16 or macOS arm64 1.4.12"):
         antigravity.verify_pinned_cli(executable)
-    with pytest.raises(SessionMigrateError, match=r"exact macOS arm64 1\.4\.12 build$"):
+    with pytest.raises(SessionMigrateError, match="installed agy is a different build"):
         antigravity.verify_pinned_cli(executable, version="1.4.12")
     assert antigravity.installed_pinned_version(executable) is None
 

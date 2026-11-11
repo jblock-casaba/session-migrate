@@ -590,6 +590,12 @@ def convert_session(session: Session, options: ConversionOptions) -> ConversionA
                 "Codex encrypted compaction state cannot be decoded by Claude; "
                 "the visible pre-compaction transcript was retained instead"
             )
+        elif kind == "opaque:claude_parent_link_repaired":
+            message = (
+                "a record's parent was never written to the Claude transcript; it was "
+                "linked to the closest earlier record by time (as Claude Code does) or "
+                "else to the latest earlier record without children"
+            )
         elif kind.startswith("opaque:copilot_unrecognized_event:"):
             message = (
                 "this Copilot event type is newer than session-migrate recognizes; it was "

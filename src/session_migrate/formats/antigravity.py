@@ -665,9 +665,13 @@ def _verify_pinned_build(
     ]
     build = next((build for build in builds if info.st_size == build.size), None)
     if build is None:
-        expected = " or ".join(f"{build.platform} {build.version}" for build in builds)
+        # Name every pinned build: the requested one is only a default when none matched.
+        expected = " or ".join(
+            f"{build.platform} {build.version}" for build in PINNED_ANTIGRAVITY_BUILDS
+        )
         raise SessionMigrateError(
-            f"Antigravity CLI binary mismatch: automatic import requires the exact {expected} build"
+            "Antigravity CLI binary mismatch: automatic import requires an exact pinned "
+            f"build ({expected}); the installed agy is a different build"
         )
     digest = _stream_sha256(path, maximum=build.size)
     if digest != build.sha256:

@@ -99,12 +99,12 @@ def parse(path: Path, *, since_last_compaction: bool = False) -> Session:
 
     skipped = 0
     if since_last_compaction:
-        records, selected_records, active, duplicate_indices = _compaction_window(path)
+        records, selected_records, active, duplicate_indices, repaired = _compaction_window(path)
         skipped = len(active) - len(selected_records)
     else:
         records = list(iter_jsonl(path))
         unique_records, duplicate_indices = _deduplicate_records(records)
-        selected_records = _active_conversation_records(unique_records)
+        selected_records, repaired = _active_conversation_records(unique_records)
         active = {record.index for record in selected_records}
     selected_session_ids = {
         string(record.value.get("sessionId"))
@@ -223,6 +223,7 @@ def parse(path: Path, *, since_last_compaction: bool = False) -> Session:
         if value.get("toolUseResult") is not None or value.get("sourceToolAssistantUUID"):
             events.append(_opaque_event(record, "top_level_tool_result_metadata"))
 
+    events.extend(_opaque_event(record, "claude_parent_link_repaired") for record in repaired)
     # Non-selected records are accounting-only and cannot affect replay order. Active
     # records before a loaded window are dropped with the history the window replaces.
     for record in records:
@@ -470,11 +471,12 @@ def serialize(
 
 def _compaction_window(
     path: Path,
-) -> tuple[list[JsonlRecord], list[JsonlRecord], set[int], set[int]]:
+) -> tuple[list[JsonlRecord], list[JsonlRecord], set[int], set[int], list[JsonlRecord]]:
     """Index a transcript, then load the active branch from its last compaction.
 
     Returns the index records (for metadata and accounting), the loaded window, the
-    indices of the whole active branch, and the indices of repeated UUID copies.
+    indices of the whole active branch, the indices of repeated UUID copies, and the
+    records whose parent link was repaired.
     """
 
     index = [
@@ -498,7 +500,7 @@ def _compaction_window(
         for record in index
     ]
     unique_records, duplicate_indices = _deduplicate_records(index)
-    chain = _active_conversation_records(unique_records)
+    chain, repaired = _active_conversation_records(unique_records)
     boundaries = [
         position
         for position, record in enumerate(chain)
@@ -519,7 +521,7 @@ def _compaction_window(
         for full, located in zip(window, chain[start:], strict=True)
     ):
         raise JsonlError("session file changed while reading; retry after it is idle")
-    return index, window, {record.index for record in chain}, duplicate_indices
+    return index, window, {record.index for record in chain}, duplicate_indices, repaired
 
 
 def _index_value(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -583,7 +585,11 @@ def _deduplicate_records(records: list[JsonlRecord]) -> tuple[list[JsonlRecord],
     return unique, duplicate_indices
 
 
-def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord]:
+def _active_conversation_records(
+    records: list[JsonlRecord],
+) -> tuple[list[JsonlRecord], list[JsonlRecord]]:
+    """Return the active branch and the records whose parent link had to be repaired."""
+
     candidates = [
         record
         for record in records
@@ -603,7 +609,7 @@ def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord
                 "Claude sidechain/subagent transcripts cannot be converted directly; "
                 "transfer the parent session"
             )
-        return []
+        return [], []
     by_uuid: dict[str, JsonlRecord] = {}
     for record in records:
         record_uuid = string(record.value.get("uuid"))
@@ -622,27 +628,32 @@ def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord
         raise SessionMigrateError("Claude last-prompt references a missing leaf UUID")
     leaf_uuid = recorded_leaf or string(candidates[-1].value.get("uuid"))
     if not leaf_uuid or leaf_uuid not in by_uuid:
-        return candidates
+        return candidates, []
 
     relinked, relinked_boundary, summarized_parent = _preserved_segment_parents(records, by_uuid)
     leaf_to_root: list[JsonlRecord] = []
+    repaired: list[JsonlRecord] = []
     seen: set[str] = set()
-    cursor: str | None = leaf_uuid
-    while cursor:
-        if cursor in seen:
-            raise SessionMigrateError("Claude active graph contains an ancestry cycle")
+    parents = {string(record.value.get("parentUuid")) for record in by_uuid.values()}
+    parents.update(relinked.values())
+    current: JsonlRecord | None = by_uuid[leaf_uuid]
+    while current is not None:
+        cursor = string(current.value.get("uuid")) or ""
         seen.add(cursor)
-        record = by_uuid.get(cursor)
-        if record is None:
-            raise SessionMigrateError("Claude active graph references a missing parent UUID")
-        leaf_to_root.append(record)
-        parent_uuid = relinked.get(cursor) or string(record.value.get("parentUuid"))
+        leaf_to_root.append(current)
+        parent_uuid = relinked.get(cursor) or string(current.value.get("parentUuid"))
         if parent_uuid:
-            cursor = parent_uuid
+            child = current
+            current = by_uuid.get(parent_uuid)
+            if current is None or parent_uuid in seen:
+                # The parent was never written (or would loop); repair the link
+                # instead of refusing the transcript.
+                current = _repaired_parent(child, by_uuid, seen, parents)
+                repaired.append(child)
             continue
         if (
-            record.value.get("type") != "system"
-            or record.value.get("subtype") != "compact_boundary"
+            current.value.get("type") != "system"
+            or current.value.get("subtype") != "compact_boundary"
         ):
             break
         # Continue into the history the compaction summarized, so a full transcript keeps
@@ -651,10 +662,65 @@ def _active_conversation_records(records: list[JsonlRecord]) -> list[JsonlRecord
         history = (
             summarized_parent
             if cursor == relinked_boundary
-            else string(record.value.get("logicalParentUuid"))
+            else string(current.value.get("logicalParentUuid"))
         )
-        cursor = None if history in seen else history
-    return list(reversed(leaf_to_root))
+        current = None if history is None or history in seen else by_uuid.get(history)
+    return list(reversed(leaf_to_root)), repaired
+
+
+# Claude Code relinks a record whose parent is missing to the closest record written
+# at most this long before it (its timestamp fallback on resume).
+_PARENT_FALLBACK_MS = 5_000
+
+
+def _repaired_parent(
+    record: JsonlRecord,
+    by_uuid: dict[str, JsonlRecord],
+    seen: set[str],
+    parents: set[str | None],
+) -> JsonlRecord | None:
+    """Choose a parent for a record whose own parent is missing or already on the path.
+
+    First as Claude Code does on resume: the closest record on the same kind of branch
+    written up to five seconds earlier. Claude ends the history when there is none;
+    instead, take the latest earlier record that has no children, since the lost
+    record was most likely its child. Otherwise the history ends here.
+    """
+
+    sidechain = record.value.get("isSidechain")
+    moment = _epoch_ms(record.value.get("timestamp"))
+    nearest: tuple[float, JsonlRecord] | None = None
+    if moment is not None:
+        for candidate in by_uuid.values():
+            if string(candidate.value.get("uuid")) in seen:
+                continue
+            if candidate.value.get("isSidechain") != sidechain:
+                continue
+            written = _epoch_ms(candidate.value.get("timestamp"))
+            if written is None:
+                continue
+            delta = moment - written
+            if 0 <= delta <= _PARENT_FALLBACK_MS and (nearest is None or delta < nearest[0]):
+                nearest = (delta, candidate)
+    if nearest is not None:
+        return nearest[1]
+    earlier = [candidate for candidate in by_uuid.values() if candidate.index < record.index]
+    for candidate in reversed(earlier):
+        candidate_uuid = string(candidate.value.get("uuid"))
+        if (
+            candidate_uuid not in seen
+            and candidate_uuid not in parents
+            and candidate.value.get("isSidechain") == sidechain
+        ):
+            return candidate
+    return None
+
+
+def _epoch_ms(value: Any) -> float | None:
+    timestamp = valid_rfc3339(value)
+    if not timestamp:
+        return None
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() * 1000
 
 
 def _preserved_segment_parents(

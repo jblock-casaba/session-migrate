@@ -217,6 +217,13 @@ Important graph and content behavior:
   metadata nodes, and follows a compaction boundary's `logicalParentUuid` back
   into pre-compaction history. It reverses the ancestry walk and emits graph
   order; physical line order is not semantic order during streamed writes.
+- A record whose parent was never written (or whose parent is already on the
+  path) is relinked rather than refused. As Claude Code does on resume, the
+  closest record on the same kind of branch written up to five seconds earlier
+  becomes the parent; when there is none, where Claude Code would end the
+  history, the latest earlier record without children is used, since the lost
+  record was most likely its child. Each repair is counted as
+  `opaque:claude_parent_link_repaired`.
 - A compaction that keeps recent turns verbatim (`compactMetadata.preservedMessages`
   or `preservedSegment`) stores them where they were first written, often before
   the boundary. As Claude Code does on load, the last boundary's preserved turns

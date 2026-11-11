@@ -132,18 +132,19 @@ def test_conflicting_duplicate_uuids_still_fail_closed(tmp_path: Path, changes: 
         claude.parse(path)
 
 
-@pytest.mark.parametrize(
-    ("parent", "error"),
-    [("missing", "missing parent UUID"), ("a1", "ancestry cycle")],
-)
-def test_duplicate_handling_does_not_bypass_graph_validation(
-    tmp_path: Path, parent: str, error: str
-) -> None:
+@pytest.mark.parametrize("parent", ["missing", "a1"])
+def test_duplicate_handling_keeps_graph_repairs_reported(tmp_path: Path, parent: str) -> None:
+    """A missing or looping parent is repaired like Claude Code does, and reported."""
+
     root = message("u1", parent, "user", "Original")
     path = write_records(tmp_path, [root, dict(root), message("a1", "u1", "assistant", "Answer")])
 
-    with pytest.raises(SessionMigrateError, match=error):
-        claude.parse(path)
+    session = claude.parse(path)
+    reasons = [event.payload.get("reason") for event in session.events]
+
+    assert [event.text for event in session.events if event.text] == ["Original", "Answer"]
+    assert reasons.count("claude_parent_link_repaired") == 1
+    assert reasons.count("duplicate_record_uuid") == 1
 
 
 def test_import_by_id_with_duplicates_preserves_last_compaction_summary(
